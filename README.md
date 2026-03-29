@@ -2,11 +2,11 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at every size.**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 31 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: persistent pthreads thread pool, 8x k-unrolled FMA micro-kernels, 5-loop cache hierarchy blocking, atomic work-stealing, merged dispatch with spin barriers, triple-adaptive MC blocking, and thermal-aware dynamic thread scaling. COM6 beats OpenBLAS across all matrix sizes on Intel Comet Lake.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 32 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: persistent pthreads thread pool, 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, atomic work-stealing, merged dispatch with spin barriers, quad-adaptive MC/KC/NC blocking, and thermal-aware dynamic thread scaling. COM6 beats OpenBLAS across all matrix sizes on Intel Comet Lake and scales to 232.6 GFLOPS on Xeon Skylake with AVX-512.
 
-## Results (v31 - Latest)
+## Results (v32 - Latest)
 
-### Peak Performance (best recorded across versions, independent cold-CPU runs)
+### Peak Performance — i7-10510U Laptop (best recorded, independent cold-CPU runs)
 
 | Size | COM6 (1T) | COM6 (MT) | OpenBLAS (1T) | OpenBLAS (MT) | COM6 MT vs BLAS MT |
 |------|-----------|-----------|---------------|---------------|-------------------|
@@ -18,6 +18,19 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 | 8192x8192 | 30.7 GF | **84.5 GF** | ~36 GF | ~75 GF | **~1.13x** |
 
 **COM6 beats OpenBLAS at every single matrix size.** Peak: 115.1 GFLOPS (2048x2048) — **47% faster than OpenBLAS MT**.
+
+### AVX-512 Performance — Xeon Skylake Server (v32, 16 cores, no thermal throttling)
+
+| Size | COM6 AVX-512 (1T) | COM6 AVX-512 (MT) | COM6 AVX2 (MT) | Speedup AVX-512 vs AVX2 |
+|------|-------------------|-------------------|----------------|------------------------|
+| 256x256 | 24.7 GF | 28.7 GF | 23.9 GF | 1.20x |
+| 512x512 | 25.7 GF | 45.9 GF | 60.8 GF | 0.75x |
+| 1024x1024 | 25.2 GF | 115.5 GF | 89.4 GF | **1.29x** |
+| 2048x2048 | 25.2 GF | **189.7 GF** | 149.1 GF | **1.27x** |
+| 4096x4096 | 25.7 GF | **217.7 GF** | 181.4 GF | **1.20x** |
+| 8192x8192 | 25.7 GF | **232.6 GF** | — | — |
+
+Peak: **232.6 GFLOPS** at 8192x8192 with AVX-512 6x16 ZMM kernel and thermal-aware thread scaling (16→13 threads). AVX-512 consistently **20-29% faster** than AVX2 at large sizes despite Skylake clock throttle.
 
 ### What Changed at 256/512 (v30-v31)
 
@@ -49,11 +62,11 @@ The thermal-aware mode detects when CPU clock throttling occurs and automaticall
 
 ## Architecture
 
-COM6 v31 implements the full BLIS 5-loop nest with persistent thread pool and thermal monitoring:
+COM6 v32 implements the full BLIS 5-loop nest with persistent thread pool, dual ISA micro-kernels, and thermal monitoring:
 
 ```
-PERSISTENT THREAD POOL (8 threads, created once)
-  jc-loop (NC=2048, L3 blocking)
+PERSISTENT THREAD POOL (auto-detect cores, created once)
+  jc-loop (NC=2048/1536 adaptive, L3 blocking)
     pc-loop (KC=256/320 adaptive, L2 blocking)
       [THERMAL CHECK: measure throughput, adjust active thread count]
       SINGLE MERGED DISPATCH:
@@ -61,22 +74,24 @@ PERSISTENT THREAD POOL (8 threads, created once)
         SPIN BARRIER (atomic, ~10ns)
         PARALLEL ic-loop (MC=48/96/120 adaptive, atomic work-stealing)
           A-packing (per-thread buffers, 2x k-unrolled)
-          jr-loop (NR=8)
+          jr-loop (NR=16 AVX-512 / NR=8 AVX2)
             ir-loop (MR=6)
-              6x8 micro-kernel (inline ASM, 8x k-unrolled)
+              6x16 ZMM micro-kernel (AVX-512, 12 accumulators, 8x k-unrolled)
+              — or —
+              6x8 YMM micro-kernel (AVX2, 12 accumulators, 8x k-unrolled)
 ```
 
 ### Key Technical Details
 
 - **Persistent pthreads pool**: Threads spin-wait (2000 iterations ~1μs) then sleep on condvar — zero fork-join overhead, minimal thermal impact when idle
-- **6x8 outer-product micro-kernel**: 12 YMM accumulators (ymm0-ymm11), broadcast A + FMA against B vectors
+- **Dual ISA micro-kernels**: AVX-512 6x16 (12 ZMM accumulators, 96 outputs/rank-1) or AVX2 6x8 (12 YMM accumulators, 48 outputs/rank-1) — compile-time selection via `__AVX512F__`
 - **8x k-unrolling**: 8 rank-1 updates per loop iteration — 97% useful FMA work vs 3% loop overhead
 - **GNU inline assembly**: Direct register allocation, zero compiler interference
 - **Merged dispatch**: B-pack + spin barrier + ic-loop in single thread wake — halves dispatch overhead vs separate phases
 - **Atomic work-stealing**: `atomic_fetch_add` for ic-blocks — dynamic load balancing with zero lock contention
 - **Direct B-packing**: `B[k][j..j+7]` is contiguous — SIMD copy, no transpose needed
-- **Triple-adaptive MC blocking**: MC=48 for n≤512 (more ic-blocks for 8 threads), MC=120 for n≤1024, MC=96 for n>1024
-- **Adaptive KC blocking**: KC=256 for n≤1024, KC=320 for larger (deeper KC amortizes packing)
+- **Quad-adaptive blocking**: MC=48/120/96 + KC=256/320 + NC=2048/1536 per problem size — four tiers targeting different cache pressure profiles
+- **L3 pressure management**: n>4096 uses NC=1536 KC=256 (B-panel=3MB) instead of NC=2048 KC=320 (B-panel=5MB) — 35% faster at 8192
 - **Thermal-aware thread scaling**: Monitors per-iteration throughput; when throttling detected, drops from 8 HyperThreads to 4 physical cores for sustained higher clocks
 - **Per-thread A buffers**: Each thread packs independently — zero false sharing
 
@@ -110,31 +125,41 @@ PERSISTENT THREAD POOL (8 threads, created once)
 | **v29** | **Thermal-aware dynamic thread scaling** | **106.3 sustained** |
 | **v30** | **Persistent pthreads pool — beat BLAS at 512** | **76.6** (512) |
 | **v31** | **Merged dispatch + MC=48 — beat BLAS at ALL sizes** | **55.3** (256) |
+| **v32** | **AVX-512 6x16 ZMM kernel + quad-adaptive blocking** | **232.6** (Xeon 8192) |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v31: Persistent thread pool (recommended)
+# v32: AVX-512 (recommended for Xeon/server)
+gcc -O3 -march=native -mfma -funroll-loops -o com6_v32 com6_v32.c -lm -lpthread
+./com6_v32
+
+# v32: AVX2 only (for laptops without AVX-512)
+gcc -O3 -march=native -mavx2 -mfma -mno-avx512f -funroll-loops -o com6_v32 com6_v32.c -lm -lpthread
+./com6_v32
+
+# v31: Previous version (persistent thread pool, AVX2 only)
 gcc -O3 -march=native -mavx2 -mfma -funroll-loops -static -o com6_v31 com6_v31.c -lm -lpthread
 ./com6_v31
-
-# v29: OpenMP thermal-aware (alternative)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -static -o com6_v29 com6_v29.c -lm
-./com6_v29
-
-# Single-threaded only
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -o com6_v26 com6_v26.c -lm
 ```
 
-## Test Platform
+## Test Platforms
 
-- Intel Core i7-10510U (Comet Lake), 4 cores / 8 threads, 15W TDP
+### Primary: Intel Core i7-10510U (Comet Lake) Laptop
+- 4 cores / 8 threads, 15W TDP
 - 64 KB L1d/core, 256 KB L2/core, 8 MB L3 shared
 - Theoretical peak: 63.2 GFLOPS/core (2 FMA units x 4 doubles x 2 flops x 3.95 GHz boost)
 - Theoretical peak (all cores): 252.8 GFLOPS
 - Thermal throttling is the dominant performance limiter on this platform
+
+### Secondary: Xeon Skylake Server (GETH)
+- 16 cores (no HyperThreading), ~2.1 GHz base
+- AVX-512 support (512-bit FMA), 16 MB L3 shared
+- No thermal throttling — sustained benchmarking
+- Theoretical peak (AVX-512): ~537 GFLOPS (16 cores x 2 FMA x 8 dp x 2.1 GHz)
+- COM6 v32 achieves **232.6 GFLOPS** = 43% of theoretical peak
 
 ## COM7NN - Custom Operation Matrix Neural Network
 
