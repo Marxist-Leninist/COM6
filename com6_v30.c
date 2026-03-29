@@ -51,18 +51,21 @@ static inline void af(double*p){_mm_free(p);}
  * ================================================================ */
 
 typedef struct {
-    /* Work descriptor — set by main before signaling */
+    /* Work descriptor */
     void (*func)(int tid, int nthreads, void* arg);
     void* arg;
 
-    /* Synchronization */
-    atomic_int generation;    /* bumped by main to signal work */
-    atomic_int done_count;    /* workers increment when done */
+    /* Synchronization — condition variable (threads SLEEP when idle = no heat) */
+    pthread_mutex_t work_mutex;
+    pthread_cond_t work_cond;      /* signal: new work available */
+    pthread_mutex_t done_mutex;
+    pthread_cond_t done_cond;      /* signal: all workers finished */
 
-    /* Thread state */
+    atomic_int generation;
+    atomic_int done_count;
+
     pthread_t threads[MAX_THREADS];
     int nthreads;
-    int worker_gen[MAX_THREADS];  /* each worker's last seen generation */
     volatile int shutdown;
 } thread_pool_t;
 
@@ -73,20 +76,36 @@ static void* worker_func(void* arg){
     int my_gen = 0;
 
     while(1){
-        /* Spin-wait for new work (or shutdown) */
-        while(atomic_load_explicit(&pool.generation, memory_order_acquire) == my_gen){
-            if(pool.shutdown) return NULL;
-            _mm_pause(); _mm_pause(); _mm_pause(); _mm_pause();
+        /* HYBRID wait: spin briefly (~1μs), then sleep if no work */
+        {
+            int spins = 0;
+            while(atomic_load_explicit(&pool.generation, memory_order_acquire) == my_gen && !pool.shutdown){
+                if(spins < 2000){
+                    _mm_pause(); _mm_pause();
+                    spins++;
+                } else {
+                    /* Fall asleep to save thermal budget */
+                    pthread_mutex_lock(&pool.work_mutex);
+                    if(atomic_load_explicit(&pool.generation, memory_order_acquire) == my_gen && !pool.shutdown)
+                        pthread_cond_wait(&pool.work_cond, &pool.work_mutex);
+                    pthread_mutex_unlock(&pool.work_mutex);
+                }
+            }
         }
-        my_gen = atomic_load_explicit(&pool.generation, memory_order_acquire);
 
         if(pool.shutdown) return NULL;
+        my_gen = atomic_load_explicit(&pool.generation, memory_order_acquire);
 
         /* Execute work */
         pool.func(tid, pool.nthreads, pool.arg);
 
         /* Signal done */
-        atomic_fetch_add_explicit(&pool.done_count, 1, memory_order_release);
+        int done = atomic_fetch_add_explicit(&pool.done_count, 1, memory_order_release) + 1;
+        if(done == pool.nthreads - 1){
+            pthread_mutex_lock(&pool.done_mutex);
+            pthread_cond_signal(&pool.done_cond);
+            pthread_mutex_unlock(&pool.done_mutex);
+        }
     }
     return NULL;
 }
@@ -98,10 +117,13 @@ static void pool_init(int nthreads){
     atomic_store(&pool.done_count, 0);
     pool.shutdown = 0;
 
-    for(int i=1; i<nthreads; i++){
-        pool.worker_gen[i] = 0;
+    pthread_mutex_init(&pool.work_mutex, NULL);
+    pthread_cond_init(&pool.work_cond, NULL);
+    pthread_mutex_init(&pool.done_mutex, NULL);
+    pthread_cond_init(&pool.done_cond, NULL);
+
+    for(int i=1; i<nthreads; i++)
         pthread_create(&pool.threads[i], NULL, worker_func, (void*)(long)i);
-    }
 }
 
 static void pool_dispatch(void (*func)(int,int,void*), void* arg){
@@ -109,23 +131,33 @@ static void pool_dispatch(void (*func)(int,int,void*), void* arg){
     pool.arg = arg;
     atomic_store_explicit(&pool.done_count, 0, memory_order_release);
 
-    /* Signal workers */
+    /* Wake all sleeping workers */
     atomic_fetch_add_explicit(&pool.generation, 1, memory_order_release);
+    pthread_mutex_lock(&pool.work_mutex);
+    pthread_cond_broadcast(&pool.work_cond);
+    pthread_mutex_unlock(&pool.work_mutex);
 
     /* Main thread does its share (tid=0) */
     func(0, pool.nthreads, arg);
 
-    /* Wait for all workers */
-    while(atomic_load_explicit(&pool.done_count, memory_order_acquire) < pool.nthreads - 1){
-        _mm_pause();
-    }
+    /* Wait for all workers to finish */
+    pthread_mutex_lock(&pool.done_mutex);
+    while(atomic_load_explicit(&pool.done_count, memory_order_acquire) < pool.nthreads - 1)
+        pthread_cond_wait(&pool.done_cond, &pool.done_mutex);
+    pthread_mutex_unlock(&pool.done_mutex);
 }
 
 static void pool_destroy(void){
     pool.shutdown = 1;
-    atomic_fetch_add_explicit(&pool.generation, 1, memory_order_release);
+    pthread_mutex_lock(&pool.work_mutex);
+    pthread_cond_broadcast(&pool.work_cond);
+    pthread_mutex_unlock(&pool.work_mutex);
     for(int i=1; i<pool.nthreads; i++)
         pthread_join(pool.threads[i], NULL);
+    pthread_mutex_destroy(&pool.work_mutex);
+    pthread_cond_destroy(&pool.work_cond);
+    pthread_mutex_destroy(&pool.done_mutex);
+    pthread_cond_destroy(&pool.done_cond);
 }
 
 /* ================================================================
