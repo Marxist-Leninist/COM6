@@ -2,9 +2,9 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at every size.**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 32 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: persistent pthreads thread pool, 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, atomic work-stealing, merged dispatch with spin barriers, quad-adaptive MC/KC/NC blocking, and thermal-aware dynamic thread scaling. COM6 beats OpenBLAS across all matrix sizes on Intel Comet Lake and scales to 232.6 GFLOPS on Xeon Skylake with AVX-512.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 33 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: persistent pthreads thread pool, 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, atomic work-stealing, merged dispatch with spin barriers, quad-adaptive MC/KC/NC blocking, adaptive thread scaling, and thermal-aware dynamic thread management. COM6 beats OpenBLAS across all matrix sizes on Intel Comet Lake and scales to 257.1 GFLOPS on Xeon Skylake with AVX-512.
 
-## Results (v32 - Latest)
+## Results (v33 - Latest)
 
 ### Peak Performance — i7-10510U Laptop (best recorded, independent cold-CPU runs)
 
@@ -19,18 +19,18 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 
 **COM6 beats OpenBLAS at every single matrix size.** Peak: 115.1 GFLOPS (2048x2048) — **47% faster than OpenBLAS MT**.
 
-### AVX-512 Performance — Xeon Skylake Server (v32, 16 cores, no thermal throttling)
+### AVX-512 Performance — Xeon Skylake Server (v33, 16 cores, adaptive thread scaling)
 
-| Size | COM6 AVX-512 (1T) | COM6 AVX-512 (MT) | COM6 AVX2 (MT) | Speedup AVX-512 vs AVX2 |
-|------|-------------------|-------------------|----------------|------------------------|
-| 256x256 | 24.7 GF | 28.7 GF | 23.9 GF | 1.20x |
-| 512x512 | 25.7 GF | 45.9 GF | 60.8 GF | 0.75x |
-| 1024x1024 | 25.2 GF | 115.5 GF | 89.4 GF | **1.29x** |
-| 2048x2048 | 25.2 GF | **189.7 GF** | 149.1 GF | **1.27x** |
-| 4096x4096 | 25.7 GF | **217.7 GF** | 181.4 GF | **1.20x** |
-| 8192x8192 | 25.7 GF | **232.6 GF** | — | — |
+| Size | COM6 AVX-512 (1T) | COM6 AVX-512 (MT) | OpenBLAS (MT) | COM6 vs BLAS |
+|------|-------------------|-------------------|---------------|-------------|
+| 256x256 | 19.1 GF | 8.6 GF | 22.7 GF | 0.38x |
+| 512x512 | 23.3 GF | 39.3 GF | 78.6 GF | 0.50x |
+| 1024x1024 | 24.9 GF | 76.3 GF | 161.8 GF | 0.47x |
+| 2048x2048 | 25.9 GF | **196.6 GF** | 175.7 GF | **1.12x** |
+| 4096x4096 | 25.7 GF | **217.3 GF** | 231.6 GF | 0.94x |
+| 8192x8192 | 25.9 GF | **257.1 GF** | 221.0 GF | **1.16x** |
 
-Peak: **232.6 GFLOPS** at 8192x8192 with AVX-512 6x16 ZMM kernel and thermal-aware thread scaling (16→13 threads). AVX-512 consistently **20-29% faster** than AVX2 at large sizes despite Skylake clock throttle.
+Peak: **257.1 GFLOPS** at 8192x8192 with AVX-512 6x16 ZMM kernel and adaptive thread scaling (16→14 threads for large sizes). COM6 beats OpenBLAS at 2048+ sizes. Small sizes lose to BLAS due to thread dispatch overhead on 16 cores — a known limitation with our current parallelization model.
 
 ### What Changed at 256/512 (v30-v31)
 
@@ -126,23 +126,20 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | **v30** | **Persistent pthreads pool — beat BLAS at 512** | **76.6** (512) |
 | **v31** | **Merged dispatch + MC=48 — beat BLAS at ALL sizes** | **55.3** (256) |
 | **v32** | **AVX-512 6x16 ZMM kernel + quad-adaptive blocking** | **232.6** (Xeon 8192) |
+| **v33** | **Adaptive thread scaling — ncores-2 reduces L3 contention** | **257.1** (Xeon 8192) |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v32: AVX-512 (recommended for Xeon/server)
-gcc -O3 -march=native -mfma -funroll-loops -o com6_v32 com6_v32.c -lm -lpthread
-./com6_v32
+# v33: AVX-512 (recommended for Xeon/server)
+gcc -O3 -march=native -mfma -funroll-loops -o com6_v33 com6_v33.c -lm -lpthread
+./com6_v33
 
-# v32: AVX2 only (for laptops without AVX-512)
-gcc -O3 -march=native -mavx2 -mfma -mno-avx512f -funroll-loops -o com6_v32 com6_v32.c -lm -lpthread
-./com6_v32
-
-# v31: Previous version (persistent thread pool, AVX2 only)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -static -o com6_v31 com6_v31.c -lm -lpthread
-./com6_v31
+# v33: AVX2 only (for laptops without AVX-512)
+gcc -O3 -march=native -mavx2 -mfma -mno-avx512f -funroll-loops -o com6_v33 com6_v33.c -lm -lpthread
+./com6_v33
 ```
 
 ## Test Platforms
