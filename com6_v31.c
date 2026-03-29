@@ -25,16 +25,19 @@
 
 #define MR  6
 #define NR  8
-#define NC  2048
+#define NC_DEFAULT 2048
+#define NC_HUGE   1536  /* For n>=8192: B-panel = 3MB fits L3, vs 5MB overflow */
 #define ALIGN 64
 
 #define KC_SMALL 256
 #define MC_SMALL 120
-#define MC_TINY  48     /* NEW: for n<=256, gives 256/48≈6 ic blocks for 8 threads */
+#define MC_TINY  48     /* For n<=512: more ic-blocks for better thread utilization */
 #define KC_LARGE 320
+#define KC_HUGE  256    /* For n>=8192: KC=256 with NC=1536 = 3.0MB B-panel */
 #define MC_LARGE 96
 #define KC_MAX 320
 #define MC_MAX 120
+#define NC_MAX 2048
 
 #define MAX_THREADS 16
 
@@ -341,13 +344,16 @@ static void macro_kernel(const double*pa,const double*pb,
             if(mr==MR&&nr==NR)micro_6x8(kc,pA,pB,Cij,n);
             else micro_edge(mr,nr,kc,pA,pB,Cij,n);}}}
 
-/* Triple-adaptive blocking: MC=48 for <=512, MC=120 for <=1024, MC=96 for >1024
- * MC=48 at 256: 6 ic-blocks (vs 3 with MC=120) — 55.3 GF (vs 42.7)
- * MC=48 at 512: 11 ic-blocks — fastest wallclock of all MC values tested */
-static void get_blocking(int n, int*pMC, int*pKC){
-    if(n <= 512)      {*pMC=MC_TINY;  *pKC=KC_SMALL;}
-    else if(n <= 1024){*pMC=MC_SMALL; *pKC=KC_SMALL;}
-    else              {*pMC=MC_LARGE; *pKC=KC_LARGE;}
+/* Quad-adaptive blocking: tuned per size range for optimal cache utilization
+ * n<=512:  MC=48 (more ic-blocks for 8 threads), KC=256, NC=2048
+ * n<=1024: MC=120, KC=256, NC=2048
+ * n<=4096: MC=96, KC=320, NC=2048 (deeper KC amortizes packing)
+ * n>=8192: MC=96, KC=256, NC=1536 (B-panel=3.0MB fits L3; NC=2048 overflows) */
+static void get_blocking(int n, int*pMC, int*pKC, int*pNC){
+    if(n <= 512)       {*pMC=MC_TINY;  *pKC=KC_SMALL; *pNC=NC_DEFAULT;}
+    else if(n <= 1024) {*pMC=MC_SMALL; *pKC=KC_SMALL; *pNC=NC_DEFAULT;}
+    else if(n <= 4096) {*pMC=MC_LARGE; *pKC=KC_LARGE; *pNC=NC_DEFAULT;}
+    else               {*pMC=MC_LARGE; *pKC=KC_HUGE;  *pNC=NC_HUGE;}
 }
 
 static double now(void){struct timespec t;timespec_get(&t,TIME_UTC);return t.tv_sec+t.tv_nsec*1e-9;}
@@ -408,13 +414,13 @@ static void com6_multiply_thermal(const double*__restrict__ A,
                                    double*__restrict__ C, int n)
 {
     int max_threads = pool.nthreads;
-    int mc_blk, kc_blk;
-    get_blocking(n, &mc_blk, &kc_blk);
+    int mc_blk, kc_blk, nc_blk;
+    get_blocking(n, &mc_blk, &kc_blk, &nc_blk);
 
     /* Allocate per-thread A buffers */
     double** pa_bufs = (double**)malloc(max_threads * sizeof(double*));
     for(int t = 0; t < max_threads; t++) pa_bufs[t] = aa((size_t)MC_MAX * KC_MAX);
-    double* pb = aa((size_t)KC_MAX * NC);
+    double* pb = aa((size_t)KC_MAX * NC_MAX);
 
     memset(C, 0, (size_t)n * n * sizeof(double));
 
@@ -436,8 +442,8 @@ static void com6_multiply_thermal(const double*__restrict__ A,
 
     pool_set_active(active_threads);
 
-    for(int jc = 0; jc < n; jc += NC){
-        int nc = (jc + NC <= n) ? NC : n - jc;
+    for(int jc = 0; jc < n; jc += nc_blk){
+        int nc = (jc + nc_blk <= n) ? nc_blk : n - jc;
         for(int pc = 0; pc < n; pc += kc_blk){
             int kc = (pc + kc_blk <= n) ? kc_blk : n - pc;
 
@@ -505,13 +511,13 @@ static void com6_multiply_pooled(const double*__restrict__ A,
                                   const double*__restrict__ B,
                                   double*__restrict__ C, int n)
 {
-    int mc_blk, kc_blk;
-    get_blocking(n, &mc_blk, &kc_blk);
+    int mc_blk, kc_blk, nc_blk;
+    get_blocking(n, &mc_blk, &kc_blk, &nc_blk);
     int nthreads = pool.nthreads;
 
     double** pa_bufs = (double**)malloc(nthreads * sizeof(double*));
     for(int t = 0; t < nthreads; t++) pa_bufs[t] = aa((size_t)MC_MAX * KC_MAX);
-    double* pb = aa((size_t)KC_MAX * NC);
+    double* pb = aa((size_t)KC_MAX * NC_MAX);
 
     memset(C, 0, (size_t)n * n * sizeof(double));
 
@@ -522,8 +528,8 @@ static void com6_multiply_pooled(const double*__restrict__ A,
     mw.A = A; mw.B = B; mw.C = C; mw.pb = pb; mw.pa_bufs = pa_bufs;
     mw.barrier = &bar;
 
-    for(int jc = 0; jc < n; jc += NC){
-        int nc = (jc + NC <= n) ? NC : n - jc;
+    for(int jc = 0; jc < n; jc += nc_blk){
+        int nc = (jc + nc_blk <= n) ? nc_blk : n - jc;
         for(int pc = 0; pc < n; pc += kc_blk){
             int kc = (pc + kc_blk <= n) ? kc_blk : n - pc;
 
@@ -545,11 +551,11 @@ static void com6_multiply(const double*__restrict__ A,
 {
     if(n <= 512 && pool.nthreads <= 1){
         /* Single-threaded fast path */
-        int mc_blk, kc_blk;
-        get_blocking(n, &mc_blk, &kc_blk);
-        double*pa=aa((size_t)MC_MAX*KC_MAX),*pb=aa((size_t)KC_MAX*NC);
+        int mc_blk, kc_blk, nc_blk;
+        get_blocking(n, &mc_blk, &kc_blk, &nc_blk);
+        double*pa=aa((size_t)MC_MAX*KC_MAX),*pb=aa((size_t)KC_MAX*NC_MAX);
         memset(C,0,(size_t)n*n*sizeof(double));
-        for(int jc=0;jc<n;jc+=NC){int nc=(jc+NC<=n)?NC:n-jc;
+        for(int jc=0;jc<n;jc+=nc_blk){int nc=(jc+nc_blk<=n)?nc_blk:n-jc;
             for(int pc=0;pc<n;pc+=kc_blk){int kc=(pc+kc_blk<=n)?kc_blk:n-pc;
                 pack_B_chunk(B,pb,kc,nc,n,jc,pc,0,nc);
                 for(int ic=0;ic<n;ic+=mc_blk){int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
@@ -568,15 +574,16 @@ static void com6_multiply_1t(const double*__restrict__ A,
                               const double*__restrict__ B,
                               double*__restrict__ C, int n)
 {
-    int mc_blk, kc_blk;
-    get_blocking(n, &mc_blk, &kc_blk);
-    /* For 1T, use standard blocking (not tiny) */
-    if(n <= 1024){mc_blk=MC_SMALL; kc_blk=KC_SMALL;}
-    else{mc_blk=MC_LARGE; kc_blk=KC_LARGE;}
+    int mc_blk, kc_blk, nc_blk;
+    get_blocking(n, &mc_blk, &kc_blk, &nc_blk);
+    /* For 1T, use standard MC (not tiny) but keep size-adaptive KC/NC */
+    if(n <= 1024){mc_blk=MC_SMALL; kc_blk=KC_SMALL; nc_blk=NC_DEFAULT;}
+    else if(n <= 4096){mc_blk=MC_LARGE; kc_blk=KC_LARGE; nc_blk=NC_DEFAULT;}
+    /* else: keep the get_blocking result (KC=256 NC=1536 for 8192+) */
 
-    double*pa=aa((size_t)MC_MAX*KC_MAX),*pb=aa((size_t)KC_MAX*NC);
+    double*pa=aa((size_t)MC_MAX*KC_MAX),*pb=aa((size_t)KC_MAX*NC_MAX);
     memset(C,0,(size_t)n*n*sizeof(double));
-    for(int jc=0;jc<n;jc+=NC){int nc=(jc+NC<=n)?NC:n-jc;
+    for(int jc=0;jc<n;jc+=nc_blk){int nc=(jc+nc_blk<=n)?nc_blk:n-jc;
         for(int pc=0;pc<n;pc+=kc_blk){int kc=(pc+kc_blk<=n)?kc_blk:n-pc;
             pack_B_chunk(B,pb,kc,nc,n,jc,pc,0,nc);
             for(int ic=0;ic<n;ic+=mc_blk){int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
