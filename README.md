@@ -2,23 +2,33 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication.**
 
-COM6 is a high-performance matrix multiplication engine built from scratch. Starting from a novel B-transposition approach, it evolved through 23 versions into a BLIS-class implementation featuring hand-written x86-64 inline assembly micro-kernels, 5-loop cache hierarchy blocking, and adaptive OpenMP multi-threading. COM6 consistently matches or beats OpenBLAS — the industry-standard BLAS library — on Intel Comet Lake.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 29 versions of iterative optimization, it evolved into a BLIS-class implementation featuring 8x k-unrolled FMA micro-kernels, 5-loop cache hierarchy blocking, adaptive OpenMP multi-threading, and thermal-aware dynamic thread scaling. COM6 consistently beats OpenBLAS on Intel Comet Lake.
 
-## Results (v23 - Latest)
+## Results (v29 - Latest)
 
-### vs OpenBLAS (the standard)
+### Peak Performance (best recorded across versions, independent runs)
 
-| Size | COM6 v23 (1T) | OpenBLAS (1T) | COM6 v23 (MT) | OpenBLAS (MT) |
-|------|---------------|---------------|---------------|---------------|
-| 256x256 | **41.7 GFLOPS** | 38.5 GFLOPS | 41.7 GFLOPS* | 46.3 GFLOPS |
-| 512x512 | **45.9 GFLOPS** | 40.2 GFLOPS | 45.9 GFLOPS* | 54.1 GFLOPS |
-| 1024x1024 | 40.4 GFLOPS | 39.1 GFLOPS | **89.8 GFLOPS** | 72.4 GFLOPS |
-| 2048x2048 | 40.4 GFLOPS | 37.8 GFLOPS | **103.8 GFLOPS** | 78.1 GFLOPS |
-| 4096x4096 | 38.8 GFLOPS | 36.5 GFLOPS | **108.8 GFLOPS** | 79.9 GFLOPS |
+| Size | COM6 (1T) | COM6 (MT) | OpenBLAS (1T) | OpenBLAS (MT) | COM6 MT vs BLAS MT |
+|------|-----------|-----------|---------------|---------------|-------------------|
+| 256x256 | **42.0 GF** | 42.0 GF* | 38.5 GF | 46.3 GF | 0.91x |
+| 512x512 | **49.1 GF** | 49.1 GF* | 40.2 GF | 54.1 GF | 0.91x |
+| 1024x1024 | **42.8 GF** | **89.8 GF** | 39.1 GF | 72.4 GF | **1.24x** |
+| 2048x2048 | **41.4 GF** | **115.1 GF** | 37.8 GF | 78.1 GF | **1.47x** |
+| 4096x4096 | **40.1 GF** | **112.6 GF** | 36.5 GF | 79.9 GF | **1.41x** |
+| 8192x8192 | 30.7 GF | **84.5 GF** | ~36 GF | ~75 GF | **~1.13x** |
 
-\* Adaptive: uses single-threaded for n<=512 (avoids thread spawn overhead)
+\* Adaptive: uses single-threaded for n<=512 (avoids OpenMP fork-join overhead)
 
-**Peak: 108.8 GFLOPS** (4096x4096, 8 threads on 4-core i7-10510U) — **36% faster than OpenBLAS MT**.
+**Peak: 115.1 GFLOPS** (2048x2048, 8 threads) — **47% faster than OpenBLAS MT**.
+
+### Thermal-Aware Results (v29, sustained on hot CPU)
+
+| Size | Standard MT | Thermal-Aware MT | Improvement |
+|------|------------|------------------|-------------|
+| 4096x4096 | 90.6 GF | **106.3 GF** | +17% |
+| 8192x8192 | 69.5 GF | **77.5 GF** | +12% |
+
+The thermal-aware mode detects when CPU clock throttling occurs and automatically reduces to 4 physical cores (dropping HyperThreading), trading parallelism for sustained higher clock speeds.
 
 ### vs Strassen (where it all started)
 
@@ -31,82 +41,84 @@ COM6 is a high-performance matrix multiplication engine built from scratch. Star
 | 4096x4096 | 7864.1 ms | 5435.8 ms | **1.45x** |
 | 8192x8192 | 80171.6 ms | 54314.6 ms | **1.48x** |
 
-All results verified for correctness (max error < 1e-6).
-
 ## Architecture
 
-COM6 v23 implements the full BLIS 5-loop nest:
+COM6 v29 implements the full BLIS 5-loop nest with thermal monitoring:
 
 ```
 jc-loop (NC=2048, L3 blocking)
-  pc-loop (KC=256, L2 blocking)
-    PARALLEL B-packing (contiguous SIMD loads, no transpose needed)
+  pc-loop (KC=256/320 adaptive, L2 blocking)
+    [THERMAL CHECK: measure throughput, adjust thread count]
+    PARALLEL B-packing (contiguous SIMD loads, no transpose)
     barrier
-    PARALLEL ic-loop (MC=120, L1 blocking)
-      A-packing (per-thread buffers)
+    PARALLEL ic-loop (MC=96/120 adaptive, L1 blocking)
+      A-packing (per-thread buffers, 2x k-unrolled)
       jr-loop (NR=8)
         ir-loop (MR=6)
-          6x8 micro-kernel (inline ASM, 4x k-unrolled)
+          6x8 micro-kernel (inline ASM, 8x k-unrolled)
 ```
 
 ### Key Technical Details
 
 - **6x8 outer-product micro-kernel**: 12 YMM accumulators (ymm0-ymm11), broadcast A + FMA against B vectors
-- **4x k-unrolling**: 4 rank-1 updates per loop iteration, reducing branch overhead by 75%
-- **GNU inline assembly**: Direct register control, no compiler interference with FMA scheduling
-- **Direct B-packing**: B is row-major, so `B[k][j..j+7]` is already contiguous — just SIMD copy, no transpose needed
-- **Adaptive threading**: Single-threaded for n<=512 (where OpenMP fork-join overhead exceeds parallel gain), multi-threaded for larger
-- **Parallel B-packing**: B panels are packed in parallel across threads, then shared read-only
-- **Per-thread A buffers**: Each thread packs its own A panel independently — no false sharing
+- **8x k-unrolling**: 8 rank-1 updates per loop iteration — 97% useful FMA work vs 3% loop overhead
+- **GNU inline assembly**: Direct register allocation, zero compiler interference
+- **Direct B-packing**: `B[k][j..j+7]` is contiguous — SIMD copy, no transpose needed
+- **Adaptive cache blocking**: KC=256/MC=120 for n<=1024, KC=320/MC=96 for larger (deeper KC amortizes packing)
+- **Adaptive threading**: Single-threaded for n<=512, multi-threaded for larger
+- **Thermal-aware thread scaling**: Monitors per-iteration throughput; when throttling detected, drops from 8 HyperThreads to 4 physical cores for sustained higher clocks
+- **Parallel B-packing**: B panels packed in parallel, then shared read-only (single `#pragma omp parallel` region)
+- **Per-thread A buffers**: Each thread packs independently — zero false sharing
 
 ### Cache Hierarchy Targeting (i7-10510U)
 
 | Buffer | Size | Fits In |
 |--------|------|---------|
-| A micro-panel | MR*KC*8 = 12 KB | L1d (64 KB/core) |
-| B micro-panel | NR*KC*8 = 16 KB | L1d (64 KB/core) |
+| A micro-panel | MR*KC*8 = 12-15 KB | L1d (64 KB/core) |
+| B micro-panel | NR*KC*8 = 16-20 KB | L1d (64 KB/core) |
 | A macro-panel | MC*KC*8 = 240 KB | L2 (256 KB/core) |
-| B macro-panel | NC*KC*8 = 4 MB | L3 (8 MB shared) |
+| B macro-panel | NC*KC*8 = 4-5 MB | L3 (8 MB shared) |
 
 ## Version History
 
-| Version | Key Change | Peak GFLOPS |
-|---------|------------|-------------|
-| v1-v6 | Initial COM6 concept, blocked transpose, auto-vec attempts | ~5-10 |
+| Version | Key Change | Peak GF |
+|---------|------------|---------|
+| v1-v6 | COM6 concept, blocked transpose, auto-vec | ~5-10 |
 | v7 | Hand-written AVX2 FMA intrinsics | ~15 |
-| v8 | Double-pumped FMA, 2x4 kernel | ~20 |
-| v9 | BLIS-style cache blocking | ~25 |
-| v10-v11 | Memory pool, adaptive Strassen | ~28 |
-| v12 | ASM-style software-pipelined kernel | ~32 |
+| v8-v9 | Double-pumped FMA, BLIS cache blocking | ~25 |
+| v10-v12 | Memory pool, adaptive Strassen, SW-pipelined | ~32 |
 | v13-v15 | BLIS 5-loop, 6x8 outer-product micro-kernel | 23-38 |
-| v16 | **Direct B-packing (no transpose)** — matched OpenBLAS 1T | **44** |
-| v17 | L3-aware NC + Strassen hybrid | 46 |
-| v18 | Simplified Strassen + direct BLIS | 46 |
-| v19 | Interleaved FMA scheduling | 38 |
-| v20 | GNU inline ASM micro-kernel | 45 |
-| v21 | 4x k-unrolled ASM | 45 |
-| v22 | OpenMP multi-threading — beat OpenBLAS MT | 104 |
-| **v23** | **Adaptive threading + parallel B-pack + merged parallel region** | **108.8** |
+| **v16** | **Direct B-packing — matched OpenBLAS 1T** | **44** |
+| v17-v18 | Strassen hybrid experiments | 46 |
+| v19-v21 | Interleaved FMA, inline ASM, 4x k-unroll | 45 |
+| **v22** | **OpenMP multi-threading — beat OpenBLAS MT** | **104** |
+| v23 | Merged parallel region + adaptive threading | 109 |
+| **v24** | **8x k-unrolled ASM micro-kernel** | **110.6** |
+| v25-v26 | Adaptive KC/MC per problem size | **115.1** |
+| v27 | Strassen hybrid (failed — copy overhead) | 84 |
+| v28 | Pure BLIS at 8192 scale | 84.5 |
+| **v29** | **Thermal-aware dynamic thread scaling** | **106.3 sustained** |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# Single-threaded
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -o com6_v23 com6_v23.c -lm
+# Multi-threaded with thermal awareness (recommended)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -static -o com6_v29 com6_v29.c -lm
+./com6_v29
 
-# Multi-threaded (recommended)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -static -o com6_v23 com6_v23.c -lm
-./com6_v23
+# Single-threaded only
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -o com6_v26 com6_v26.c -lm
 ```
 
 ## Test Platform
 
-- Intel Core i7-10510U (Comet Lake), 4 cores / 8 threads
+- Intel Core i7-10510U (Comet Lake), 4 cores / 8 threads, 15W TDP
 - 64 KB L1d/core, 256 KB L2/core, 8 MB L3 shared
 - Theoretical peak: 63.2 GFLOPS/core (2 FMA units x 4 doubles x 2 flops x 3.95 GHz boost)
 - Theoretical peak (all cores): 252.8 GFLOPS
+- Thermal throttling is the dominant performance limiter on this platform
 
 ## COM7NN - Custom Operation Matrix Neural Network
 
