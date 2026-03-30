@@ -29,8 +29,9 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 | 2048x2048 | 25.7 GF | **189.0 GF** | 175.7 GF | **1.08x** |
 | 4096x4096 | 25.7 GF | **240.8 GF** | 231.6 GF | **1.04x** |
 | 8192x8192 | 25.5 GF | **255.2 GF** | 221.0 GF | **1.15x** |
+| 16384x16384 | 23.8 GF | **181.8 GF** | 238.5 GF | 0.76x |
 
-Peak: **255.2 GFLOPS** at 8192x8192 with AVX-512 6x16 ZMM kernel. v35's size-aware thread capping uses `2*sqrt(n/64)` threads for small sizes (4 threads at 256, 6 at 512, 8 at 1024) and all cores for n>=2048. COM6 now beats OpenBLAS at **5 out of 6 sizes** on Xeon (up from 2/6 in v33). 256x256 is **1.96x faster** than OpenBLAS — a 5.2x improvement over v33.
+Peak: **255.2 GFLOPS** at 8192x8192 with AVX-512 6x16 ZMM kernel. v35's size-aware thread capping uses `2*sqrt(n/64)` threads for small sizes (4 threads at 256, 6 at 512, 8 at 1024) and all cores for n>=2048. COM6 beats OpenBLAS at **5 out of 7 sizes** on Xeon. At 16384, COM6 maintained a working RSS of ~6.3 GB (close to the 6.0 GiB theoretical A+B+C floor), while concurrent OpenBLAS+numpy exceeded available memory and was OOM-killed.
 
 ### What Changed at 256/512 (v30-v31)
 

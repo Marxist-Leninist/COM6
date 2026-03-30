@@ -598,7 +598,7 @@ int main(void){
 
     pool_init(nthreads);
 
-    int sizes[]={256,512,1024,2048,4096,8192};
+    int sizes[]={256,512,1024,2048,4096,8192,16384};
     int ns=sizeof(sizes)/sizeof(sizes[0]);
 
     printf("%-10s | %10s | %10s | %8s | %8s | %s\n",
