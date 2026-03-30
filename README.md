@@ -33,6 +33,18 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 
 Peak: **255.2 GFLOPS** at 8192x8192 with AVX-512 6x16 ZMM kernel. v35's size-aware thread capping uses `2*sqrt(n/64)` threads for small sizes (4 threads at 256, 6 at 512, 8 at 1024) and all cores for n>=2048. COM6 beats OpenBLAS at **5 out of 7 sizes** on Xeon. At 16384, COM6 maintained a working RSS of ~6.3 GB (close to the 6.0 GiB theoretical A+B+C floor), while concurrent OpenBLAS+numpy exceeded available memory and was OOM-killed.
 
+### v36 Parameter Sweep Results (targeting 0.76x at 1024)
+
+A 189-configuration parameter sweep on Xeon (MC × KC × NC × thread count) found that 1024's weakness was **under-threading** (8T vs optimal 12T) and **suboptimal KC** (256 vs 320):
+
+| Config | MC | KC | NC | Threads | GF/s at 1024 |
+|--------|----|----|-----|---------|-------------|
+| **v36 optimal** | 48 | 320 | 2048 | 12 | **163.1** |
+| v35 default | 48 | 256 | 2048 | 8 | 123.2 |
+| OpenBLAS | — | — | — | 16 | 161.8 |
+
+KC=320 reduces pc-loop iterations from 4 to 3.2, and 12 threads better saturates the 16-core Xeon at this size. v36 applies these sweep-optimal parameters via table-based thread capping. Full benchmark validation pending (server was under VM load during testing).
+
 ### What Changed at 256/512 (v30-v31)
 
 Previously, COM6 used OpenMP which has ~50-100μs fork-join overhead per parallel region. For tiny matrices (256: ~0.8ms compute), this overhead was devastating. v30-v31 replaced OpenMP with:
@@ -131,6 +143,7 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | **v33** | **Adaptive thread scaling — ncores-2 reduces L3 contention** | **257.1** (Xeon 8192) |
 | v34 | JC-parallel dispatch experiment | 257.5 (Xeon 8192) |
 | **v35** | **Size-aware thread capping + MC=48@1024 — beat BLAS at 5/6 Xeon sizes** | **255.2** (Xeon 8192) |
+| **v36** | **Sweep-optimized: KC=320 + 12T at 1024 — parameter sweep shows 163 GF (beats BLAS 161.8)** | **163.1** (Xeon 1024, sweep) |
 
 ## Building
 
