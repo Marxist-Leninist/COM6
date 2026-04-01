@@ -4,33 +4,33 @@
 
 COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 40 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive NC/MC/KC blocking, C-prefetch micro-kernels, and single-parallel-region threading. COM6 beats OpenBLAS across all matrix sizes on both Intel Comet Lake (laptop) and Xeon Skylake (server), scaling to 255 GFLOPS with AVX-512. v40 adds C-line prefetching in the micro-kernel and wraps the full jc+pc loop in a single parallel region.
 
-## Results (v40 - Latest)
+## Results (v41 - Latest)
 
 ### Peak Performance — i7-10510U Laptop (best recorded, independent cold-CPU runs)
 
 | Size | COM6 (1T) | COM6 (MT) | OpenBLAS (1T) | OpenBLAS (MT) | COM6 MT vs BLAS MT |
 |------|-----------|-----------|---------------|---------------|-------------------|
 | 256x256 | **35.1 GF** | **48.8 GF** | 38.5 GF | 46.3 GF | **1.05x** |
-| 512x512 | **38.2 GF** | **62.4 GF** | 40.2 GF | 54.1 GF | **1.15x** |
-| 1024x1024 | **37.4 GF** | **105.2 GF** | 39.1 GF | 72.4 GF | **1.45x** |
-| 2048x2048 | **33.9 GF** | **85.2 GF** | 37.8 GF | 78.1 GF | **1.09x** |
-| 4096x4096 | **34.7 GF** | **85.9 GF** | 36.5 GF | 79.9 GF | **1.08x** |
-| 8192x8192 | **33.2 GF** | **77.2 GF** | ~36 GF | ~75 GF | **~1.03x** |
+| 512x512 | **44.5 GF** | **62.4 GF** | 40.2 GF | 54.1 GF | **1.15x** |
+| 1024x1024 | **45.6 GF** | **105.2 GF** | 39.1 GF | 72.4 GF | **1.45x** |
+| 2048x2048 | **41.1 GF** | **98.9 GF** | 37.8 GF | 78.1 GF | **1.27x** |
+| 4096x4096 | **37.5 GF** | **102.2 GF** | 36.5 GF | 79.9 GF | **1.28x** |
+| 8192x8192 | **32.5 GF** | **80.8 GF** | ~36 GF | ~75 GF | **~1.08x** |
 
-**COM6 beats OpenBLAS at every single matrix size.** Peak: 105.2 GFLOPS (1024x1024) — **45% faster than OpenBLAS MT**.
+**COM6 beats OpenBLAS at every single matrix size.** Peak: 105.2 GFLOPS (1024x1024) — **45% faster than OpenBLAS MT**. v41's 1T performance reaches 72.2% of theoretical peak (45.6/63.2 GF at 1024).
 
-### v40 Typical Run (warm laptop, 8 threads)
+### v41 Full Benchmark (8 threads, sequential run)
 
 | Size | 1-Thread | MT | GF(1T) | GF(MT) |
 |------|----------|-----|--------|--------|
-| 256x256 | 1.0 ms | 1.0 ms | 32.4 | 33.2 |
-| 512x512 | 7.0 ms | 7.3 ms | 38.2 | 36.7 |
-| 1024x1024 | 70.4 ms | 29.8 ms | 30.5 | 72.0 |
-| 2048x2048 | 552.9 ms | 251.9 ms | 31.1 | 68.2 |
-| 4096x4096 | (skip) | 2125 ms | -- | 64.7 |
-| 8192x8192 | (skip) | 18438 ms | -- | 59.6 |
+| 256x256 | 1.1 ms | 0.9 ms | 31.8 | 35.4 |
+| 512x512 | 6.0 ms | 6.6 ms | 44.5 | 40.9 |
+| 1024x1024 | 47.1 ms | 24.3 ms | 45.6 | 88.5 |
+| 2048x2048 | 417.7 ms | 173.8 ms | 41.1 | 98.9 |
+| 4096x4096 | (skip) | 1344 ms | -- | 102.2 |
+| 8192x8192 | (skip) | 13912 ms | -- | 79.0 |
 
-v40's C-prefetch micro-kernel boosted 1T performance ~40% vs v26 at small sizes. 8192x8192 = 1.1 trillion FLOPs computed in 18.4 seconds.
+v41 key improvements: C-prefetch micro-kernel (v40), deep KC=512 for 8192+ (v41). 8192x8192 = 1.1 trillion FLOPs in 13.6 seconds (cold CPU: 80.8 GF).
 
 ### AVX-512 Performance — Xeon Skylake Server (v35, 16 cores, size-aware thread scaling)
 
@@ -160,16 +160,18 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | v37 | pthreads pool experiment — slower than OpenMP on laptop | 54.2 |
 | **v38** | **v26 OpenMP core + 8192 + adaptive NC=3072 for n>2048** | **65.5** (laptop 2048 MT) |
 | v39 | Always-MT + MC=48 for small sizes | 69.4 (512 MT) |
-| **v40** | **C-prefetch micro-kernel + single parallel region + NC=1024 for 8192** | **72.0** (1024 MT), **59.6** (8192 MT) |
+| **v40** | **C-prefetch micro-kernel + single parallel region** | **72.0** (1024 MT), **59.6** (8192 MT) |
+| **v41** | **Deep KC=512 for 8192 + MC=60 (clean MR divisibility)** | **102.2** (4096 MT), **80.8** (8192 MT) |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v40: AVX2 + OpenMP (recommended for laptops, latest)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v40 com6_v40.c -lm
-./com6_v40
+# v41: AVX2 + OpenMP (recommended for laptops, latest)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v41 com6_v41.c -lm
+./com6_v41           # full benchmark
+./com6_v41 4096      # single-size cold CPU test
 
 # v38: AVX2 + OpenMP
 gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v38 com6_v38.c -lm
