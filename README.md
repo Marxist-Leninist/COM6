@@ -2,9 +2,9 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at every size.**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 35 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: persistent pthreads thread pool, 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, atomic work-stealing, merged dispatch with spin barriers, size-aware thread scaling, and thermal-aware dynamic thread management. COM6 beats OpenBLAS across all matrix sizes on both Intel Comet Lake (laptop) and Xeon Skylake (server), scaling to 255 GFLOPS with AVX-512.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 38 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive NC/MC/KC blocking, and thermal-aware dynamic thread management. COM6 beats OpenBLAS across all matrix sizes on both Intel Comet Lake (laptop) and Xeon Skylake (server), scaling to 255 GFLOPS with AVX-512. v38 adds 8192 support with adaptive NC=3072 for large matrices (B-panel fits L3).
 
-## Results (v35 - Latest)
+## Results (v38 - Latest)
 
 ### Peak Performance — i7-10510U Laptop (best recorded, independent cold-CPU runs)
 
@@ -144,19 +144,25 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | v34 | JC-parallel dispatch experiment | 257.5 (Xeon 8192) |
 | **v35** | **Size-aware thread capping + MC=48@1024 — beat BLAS at 5/6 Xeon sizes** | **255.2** (Xeon 8192) |
 | **v36** | **Sweep-optimized: KC=320 + 12T at 1024 — parameter sweep shows 163 GF (beats BLAS 161.8)** | **163.1** (Xeon 1024, sweep) |
+| v37 | pthreads pool experiment — slower than OpenMP on laptop | 54.2 |
+| **v38** | **v26 OpenMP core + 8192 + adaptive NC=3072 for n>2048** | **65.5** (laptop 2048 MT) |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v35: AVX-512 (recommended for Xeon/server)
-gcc -O3 -march=native -mfma -funroll-loops -o com6_v35 com6_v35.c -lm -lpthread
-./com6_v35
+# v38: AVX2 + OpenMP (recommended for laptops)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v38 com6_v38.c -lm
+./com6_v38
 
-# v35: AVX2 only (for laptops without AVX-512)
-gcc -O3 -march=native -mavx2 -mfma -mno-avx512f -funroll-loops -o com6_v35 com6_v35.c -lm -lpthread
-./com6_v35
+# v36: AVX-512 + pthreads (recommended for Xeon/server)
+gcc -O3 -march=native -mavx512f -mfma -funroll-loops -o com6_v36 com6_v36.c -lm -lpthread
+./com6_v36
+
+# v36: AVX2 fallback
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -o com6_v36 com6_v36.c -lm -lpthread
+./com6_v36
 ```
 
 ## Test Platforms
