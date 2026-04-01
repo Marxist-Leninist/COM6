@@ -2,46 +2,49 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at all sizes that matter (512+).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 46 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive NC/MC/KC blocking, beta=0 memset elimination, C-prefetch micro-kernels, and single-parallel-region threading. COM6 beats OpenBLAS at 4/6 tested sizes on Intel Comet Lake and scales to 255 GFLOPS with AVX-512 on Xeon.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 49 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive NC/MC/KC blocking, beta=0 memset elimination, C-prefetch micro-kernels, load-balanced threading, and no-pack fast paths. COM6 beats OpenBLAS at 5/6 tested sizes on Intel Comet Lake and scales to 255 GFLOPS with AVX-512 on Xeon.
 
-## Results (v46 - Latest)
+## Results (v49 - Latest)
 
-### v45 vs OpenBLAS MT (fair interleaved comparison, 3s cooling between tests)
+### v49 vs OpenBLAS MT (fair interleaved comparison, 3s cooling between tests)
 
 | Size | OpenBLAS MT | COM6 MT | Ratio | Winner |
 |------|-------------|---------|-------|--------|
-| 256x256 | 101.4 GF | 32.3 GF | 0.32x | BLAS |
-| 512x512 | 77.5 GF | **91.6 GF** | **1.18x** | **COM6** |
-| 1024x1024 | 97.4 GF | 92.5 GF | 0.95x | BLAS (close) |
-| 2048x2048 | 113.1 GF | **125.6 GF** | **1.11x** | **COM6** |
-| 4096x4096 | 110.6 GF | **124.3 GF** | **1.12x** | **COM6** |
-| 8192x8192 | 85.7 GF | **95.2 GF** | **1.11x** | **COM6** |
+| 256x256 | 96.7 GF | 52.8 GF | 0.55x | BLAS |
+| 512x512 | 85.9 GF | **100.2 GF** | **1.17x** | **COM6** |
+| 1024x1024 | 113.9 GF | **120.2 GF** | **1.06x** | **COM6** |
+| 2048x2048 | 112.8 GF | **124.0 GF** | **1.10x** | **COM6** |
+| 4096x4096 | 105.9 GF | **123.6 GF** | **1.17x** | **COM6** |
+| 8192x8192 | 83.8 GF | **102.6 GF** | **1.22x** | **COM6** |
 
-**COM6 wins 4/6 sizes.** Beats OpenBLAS by 11-18% at 512-8192. Only loses at 256 (OpenBLAS has specialized no-pack small-matrix kernels) and barely at 1024 (0.95x, thermal).
+**COM6 wins 5/6 sizes.** Beats OpenBLAS by 6-22% at 512-8192. Only loses at 256 (OpenMP fork/join overhead dominates at 33M FLOPs).
 
-### v46 Full Benchmark (8 threads, sequential run)
+### v49 Full Benchmark (8 threads, sequential run)
 
 | Size | 1-Thread | MT | GF(1T) | GF(MT) |
 |------|----------|-----|--------|--------|
-| 256x256 | 0.9 ms | 0.9 ms | 38.7 | 37.7 |
-| 512x512 | 5.4 ms | 3.2 ms | 50.1 | 84.2 |
-| 1024x1024 | 43.9 ms | 22.6 ms | 48.9 | 94.9 |
-| 2048x2048 | 375.1 ms | 136.2 ms | 45.8 | **126.2** |
-| 4096x4096 | (skip) | 1093.8 ms | -- | **125.6** |
-| 8192x8192 | (skip) | 8728.5 ms | -- | **126.0** |
+| 256x256 | 0.9 ms | 0.7 ms | 37.3 | 50.9 |
+| 512x512 | 5.5 ms | 2.8 ms | 48.7 | **95.0** |
+| 1024x1024 | 44.4 ms | 17.4 ms | 48.4 | **123.7** |
+| 2048x2048 | 365.0 ms | 137.6 ms | 47.1 | **124.9** |
+| 4096x4096 | (skip) | 1117.8 ms | -- | **123.0** |
+| 8192x8192 | (skip) | 8683.9 ms | -- | **126.6** |
 
-**Peak: 126.2 GFLOPS** at 2048x2048. v45 cold-start 8192: 126 GF, cold-start 4096: 123 GF.
+**Peak: 126.6 GFLOPS** at 8192x8192. Cold-start 1024: 124 GF.
 
-### Key improvements v43-v46 (over v42)
+### Key improvements v43-v49
 
 - **beta=0 micro-kernel** (v43): First pc iteration stores directly, eliminating memset. Saves ~1GB memory traffic at 8192.
-- **L3-optimized 8192 tier** (v43): KC=320/MC=96/NC=1024 keeps B panel at 2.5MB (31% of L3) vs v42's 4MB (50%).
+- **L3-optimized 8192 tier** (v43): KC=320/MC=96/NC=1024 keeps B panel at 2.5MB (31% of L3).
 - **L1-correct KC** (v43): KC=320 keeps micro-panels (35KB) near L1 (32KB) — v42's KC=512 overflowed L1 (57KB).
-- **Smart thread threshold** (v44): n<=256 runs 1T (fork overhead > compute at 33M FLOPs).
 - **4x k-unrolled pack_A** (v45): 24 independent loads+stores per loop body for better ILP.
-- **MC_TINY=48 for small sizes** (v46): Enables MT at all sizes with sufficient ic-blocks for 8 threads.
+- **MC_TINY=48 for MT** (v46): More ic-blocks for better thread utilization at small/medium sizes.
+- **No-pack small path** (v47): Skip packing for n<=256 — direct AVX2 FMA on unpacked data.
+- **8-wide j processing** (v48): 2x ymm per j-iteration in no-pack path.
+- **Fixed MT load balancing** (v49): `omp for schedule(static)` replaces manual ic-distribution that left threads idle (e.g., 11 blocks / 8 threads → 2 threads got nothing). **1024: 95→124 GF (+30%), 512: 88→95 GF (+8%).**
+- **No-pack beta=0** (v49): Skip memset in small path — first k stores directly.
 
-Single-size cold-start: `./com6_v46 8192`
+Single-size cold-start: `./com6_v49 8192`
 
 ### AVX-512 Performance — Xeon Skylake Server (v35, 16 cores, size-aware thread scaling)
 
@@ -178,16 +181,19 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | **v44** | **Smart thread threshold — 1T for n<=256, wins 5/6 vs BLAS** | **86.2** (1024 MT), **73.9** (8192 MT) |
 | **v45** | **4x k-unrolled pack_A for better ILP** | **95.3** (1024 MT), **126.0** (8192 MT) |
 | **v46** | **MC_TINY=48 for all-size MT + v45 core** | **126.2** (2048 MT), **125.6** (4096 MT) |
+| v47 | No-pack path for n<=256 (skip packing entirely) | 50 (256 MT) |
+| v48 | 8-wide j no-pack kernel (2x ymm per j-iteration) | 50 (256 MT) |
+| **v49** | **Fixed MT load balancing: omp for schedule(static) + MC_TINY for <=1024** | **123.7** (1024 MT), **126.6** (8192 MT) |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v46: AVX2 + OpenMP (recommended for laptops, latest)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v46 com6_v46.c -lm
-./com6_v46           # full benchmark
-./com6_v46 4096      # single-size cold CPU test
+# v49: AVX2 + OpenMP (recommended for laptops, latest)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v49 com6_v49.c -lm
+./com6_v49           # full benchmark
+./com6_v49 4096      # single-size cold CPU test
 
 # v38: AVX2 + OpenMP
 gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v38 com6_v38.c -lm
