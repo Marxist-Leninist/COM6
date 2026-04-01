@@ -39,19 +39,25 @@ def bench_com6_single(exe, n):
         line = line.strip()
         if 'x' in line and ('OK' in line or 'FAIL' in line):
             parts = [p.strip() for p in line.split('|')]
-            if len(parts) >= 6:
+            if len(parts) >= 5:
                 try:
-                    gfm_s = parts[4].strip()
-                    return float(gfm_s) if gfm_s not in ('--', '-') else 0
+                    # Try different column positions for GF(MT)
+                    for idx in range(len(parts)-2, 2, -1):
+                        s = parts[idx].strip()
+                        if s not in ('--', '-', '') and 'OK' not in s and 'FAIL' not in s and 'skip' not in s:
+                            try:
+                                return float(s)
+                            except ValueError:
+                                continue
                 except: pass
     return 0
 
 if __name__ == "__main__":
     sizes = [256, 512, 1024, 2048, 4096, 8192]
-    exe = "C:/Users/Scott/com6_v43.exe"
+    exe = "C:/Users/Scott/com6_v45.exe"
 
     print("=" * 80)
-    print("  COM6 v43 vs OpenBLAS MT — Fair Interleaved Comparison")
+    print("  COM6 v45 vs OpenBLAS MT — Fair Interleaved Comparison")
     print("  (each size tested independently with cooling)")
     print("=" * 80)
     print()
