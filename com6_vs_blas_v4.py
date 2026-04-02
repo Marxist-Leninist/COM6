@@ -54,10 +54,10 @@ def bench_com6_single(exe, n):
 
 if __name__ == "__main__":
     sizes = [256, 512, 1024, 2048, 4096, 8192]
-    exe = "C:/Users/Scott/com6_v45.exe"
+    exe = "C:/Users/Scott/com6_v50.exe"
 
     print("=" * 80)
-    print("  COM6 v45 vs OpenBLAS MT — Fair Interleaved Comparison")
+    print("  COM6 v50 vs OpenBLAS MT — Fair Interleaved Comparison")
     print("  (each size tested independently with cooling)")
     print("=" * 80)
     print()
