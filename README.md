@@ -2,7 +2,7 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at all sizes that matter (512+).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 50 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive NC/MC/KC blocking, beta=0 memset elimination, C-prefetch micro-kernels, distributed prefetch scheduling, load-balanced threading, and register-blocked small-matrix paths. COM6 beats OpenBLAS at 5/6 tested sizes on Intel Comet Lake (up to 18% faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 52 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive NC/MC/KC blocking, beta=0 memset elimination, C-prefetch micro-kernels, distributed prefetch scheduling, load-balanced threading, and register-blocked small-matrix paths. COM6 beats OpenBLAS at 5/6 tested sizes on Intel Comet Lake (up to 18% faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
 
 ## Results (v50 - Latest)
 
@@ -44,8 +44,13 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 - **Pack-A source prefetch** (v50): Prefetch next A rows while packing current panel.
 - **4x k-unrolled small path** (v50): Small-matrix kernel processes 4 k-iterations per inner loop for better ILP — **256: 33→53 GF (+60%)**.
 - **OpenMP warmup** (v50): Pre-fork thread pool before benchmarking eliminates first-call overhead.
+- **NC=2048 for all sizes** (v51): Halves jc iterations for 8192 (4 vs 8), cutting A-panel repacking overhead in half (8944 vs 17888 pack_A calls).
+- **C-prefetch in macro_kernel** (v51): Prefetch next ir-block's C rows before micro_6x8, initiating RFO early to hide store-miss latency.
+- **Thermal-aware benchmarking** (v51): 5-second cooldown between sizes in full benchmark to combat laptop TDP throttling.
+- **L2-aware NC blocking** (v52, experimental): NC=128 for n<=512 MT so B-panel (256KB) fits per-core L2 instead of spilling to L3.
+- **Physical-core threading** (v52, experimental): 4 threads for n<=512 to avoid HT contention on compute-bound micro-kernels.
 
-Single-size cold-start: `./com6_v50 8192`
+Single-size cold-start: `./com6_v51 8192`
 
 ### AVX-512 Performance — Xeon Skylake Server (v35, 16 cores, size-aware thread scaling)
 
