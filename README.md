@@ -2,9 +2,22 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at all sizes that matter (512+).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 61 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with four-tier adaptive MC/KC blocking, C-output prefetching, 4x-unrolled panel packing, and L3-pressure-aware blocking for large matrices. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.47x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 64 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC blocking, C-output prefetching, 4x-unrolled panel packing, and dynamic scheduling for large matrices. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.47x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
 
-## Results (v61 - Latest)
+## Results (v62 - Latest)
+
+### v62 Full Benchmark (8 threads, 4s cooldown between sizes)
+
+| Size | 1-Thread | MT | GF(1T) | GF(MT) |
+|------|----------|-----|--------|--------|
+| 256x256 | 1.4 ms | 1.4 ms | 24.0 | 24.0 |
+| 512x512 | 7.3 ms | 8.1 ms | **36.9** | 33.1 |
+| 1024x1024 | 72.9 ms | 35.9 ms | 29.5 | **59.8** |
+| 2048x2048 | 960.3 ms | 337.8 ms | 17.9 | **50.9** |
+| 4096x4096 | -- | 2247.2 ms | -- | **61.2** |
+| **8192x8192** | -- | 20090.7 ms | -- | **54.7** |
+
+v62 is a clean rewrite returning to v26's proven 2-tier adaptive blocking after discovering that v28-v61 had blocking parameter regressions (wrong KC/MC for large sizes). v62 adds C-prefetch micro-kernel, 4x unrolled A-packing, dynamic scheduling, and isolated CLI mode.
 
 ### v61 vs OpenBLAS MT (fair interleaved comparison, 5s cooling between tests)
 
@@ -52,15 +65,21 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 
 **Peak: 125.3 GFLOPS** at 2048. 1T peak: **50.2 GF** at 1024 (79% of theoretical single-core peak).
 
-### Key improvements v61
+### Key improvements v62
 
-- **C-output prefetch in micro-kernel** (v61): Prefetches all 6 output rows of C into L1 at the start of the micro-kernel, before the k-loop begins. This ensures the final load+add+store phase hits L1 instead of incurring expensive cache misses.
-- **MT for all sizes** (v61): Enables multi-threading for n>=256 (was n>512). Since BLAS uses MT at all sizes, COM6 must too. This alone jumped 512 from 24 GF to 42.8 GF.
-- **Four-tier adaptive blocking** (v61): MC_TINY=36 for n<=256 (gives 8 ic-blocks matching 8 threads), MC=120/KC=256 for n<=1024, MC=96/KC=320 for n<=2048, MC=120/KC=256 for n>2048 (L3-friendly: B-panel=4.2MB = 52% of 8MB L3).
-- **L3-pressure-aware blocking** (v61): For n>2048, uses KC=256 instead of KC=320/384 to keep the B-panel at 4.2MB (52% of L3) instead of 5.2-6.3MB (65-79%). This improved 8192 from 29.9 GF to 43.7 GF (+46%).
-- **4x unrolled A-packing** (v60): 24 loads + 24 stores per iteration, halving loop overhead.
-- **Dynamic scheduling for large sizes** (v61): `schedule(dynamic,1)` for n>2048 handles thermal throttle imbalance between threads.
-- **CLI single-size mode** (v61): `./com6_v61 <size> [mt|1t]` for isolated cold-CPU tests.
+- **Restored v26 proven blocking** (v62): v28-v61 had blocking regressions (wrong KC/MC for large sizes, e.g. v61 line 434 used KC_SMALL=256 for n>2048 instead of KC_LARGE=320). v62 goes back to v26's proven 2-tier: MC=120/KC=256 for n<=1024, MC=96/KC=320 for n>1024. Both fit L2=256KB (240KB used).
+- **C-output prefetch in micro-kernel** (v61/v62): Prefetches all 6 output rows of C into L1 at the start of the micro-kernel. Uses r15 register to walk C rows before the k-loop begins.
+- **4x unrolled A-packing** (v60/v62): 24 loads + 24 stores per iteration, halving loop overhead.
+- **Dynamic scheduling** (v62): `schedule(dynamic,1)` for MT loop — better load balance on thermally-throttled cores.
+- **CLI single-size mode** (v62): `./com6_v62 <size> [mt|1t]` for isolated cold-CPU tests.
+- **8192 support**: Tested and working at 8192x8192 (54.7 GF MT).
+
+### Key improvements v61 (historical)
+
+- **C-output prefetch in micro-kernel** (v61): Prefetches all 6 output rows of C into L1 at the start of the micro-kernel.
+- **MT for all sizes** (v61): Enables multi-threading for n>=256 (was n>512).
+- **Four-tier adaptive blocking** (v61): MC_TINY=36 for n<=256, MC=120/KC=256 for n<=1024, MC=96/KC=320 for n<=2048, MC=120/KC=256 for n>2048.
+- **NOTE**: v61 had a blocking regression at line 434 (`else{*pMC=MC_SMALL;*pKC=KC_SMALL;}`) that used small-size blocking for all n>2048. Fixed in v62.
 
 ### Key improvements v43-v50
 
@@ -231,17 +250,21 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | v59 | Always-MT + small-size MC tuning experiments | varies |
 | v60 | 4x A-pack unroll + parallel C-zeroing + streaming B-pack | 42.0 (8192 MT) |
 | **v61** | **C-prefetch micro-kernel + 4-tier blocking + L3-aware KC + MT all sizes — beats BLAS at ALL sizes by 36-147%** | **50.3** (1024 MT), **44.9** (8192 MT), 1.36-2.47x vs BLAS |
+| **v62** | **Clean rewrite: v26 proven blocking + C-prefetch + dynamic scheduling — fixes v28-v61 blocking regressions** | **61.2** (4096 MT), **54.7** (8192 MT), **36.9** (512 1T) |
+| v63 | NC=1024 for 8192+ (L3-fit experiment) — slower due to extra B-packing overhead | 43.2 (8192 MT) |
+| v64 | JC-parallel (barrier-free MT, each thread owns columns) — slower at 2048 due to duplicated A-packing | 55.5 (4096 MT) |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v61: AVX2 + OpenMP + C-prefetch + L3-aware blocking (recommended, latest)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v61 com6_v61.c -lm
-./com6_v61           # full benchmark
-./com6_v61 4096 mt   # single-size MT cold CPU test
-./com6_v61 512 1t    # single-size 1T test
+# v62: AVX2 + OpenMP + C-prefetch + proven blocking (recommended, latest)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v62 com6_v62.c -lm
+./com6_v62           # full benchmark (256-8192, 4s cooldown between sizes)
+./com6_v62 4096 mt   # single-size MT cold CPU test
+./com6_v62 512 1t    # single-size 1T test
+./com6_v62 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
 
 # v38: AVX2 + OpenMP
 gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v38 com6_v38.c -lm
