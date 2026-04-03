@@ -415,9 +415,12 @@ static void macro_kernel_1t(const double*pa,const double*pb,
     }
 }
 
-/* v26's proven 2-tier adaptive blocking */
+/* 3-tier adaptive blocking: small MT needs fewer rows per panel */
+#define MC_TINY 48
+
 static void get_blocking(int n, int*pMC, int*pKC){
-    if(n <= 1024){*pMC=MC_SMALL;*pKC=KC_SMALL;}
+    if(n <= 512){*pMC=MC_TINY;*pKC=KC_SMALL;}      /* 512/48=10.7 ic-blocks for 8 threads */
+    else if(n <= 1024){*pMC=MC_SMALL;*pKC=KC_SMALL;} /* 1024/120=8.5 blocks */
     else{*pMC=MC_LARGE;*pKC=KC_LARGE;}
 }
 
@@ -430,7 +433,7 @@ static void com6_multiply(const double*__restrict__ A,
     nthreads = omp_get_max_threads();
     #endif
 
-    int use_mt = (n > 512 && nthreads > 1);
+    int use_mt = (n >= 512 && nthreads > 1);
     int mc_blk, kc_blk;
     get_blocking(n, &mc_blk, &kc_blk);
 

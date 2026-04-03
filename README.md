@@ -6,18 +6,19 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 
 ## Results (v62 - Latest)
 
-### v62 Full Benchmark (8 threads, 4s cooldown between sizes)
+### v62 vs OpenBLAS MT (fair interleaved comparison, 5s cooling between tests)
 
-| Size | 1-Thread | MT | GF(1T) | GF(MT) |
-|------|----------|-----|--------|--------|
-| 256x256 | 1.4 ms | 1.4 ms | 24.0 | 24.0 |
-| 512x512 | 7.3 ms | 8.1 ms | **36.9** | 33.1 |
-| 1024x1024 | 72.9 ms | 35.9 ms | 29.5 | **59.8** |
-| 2048x2048 | 960.3 ms | 337.8 ms | 17.9 | **50.9** |
-| 4096x4096 | -- | 2247.2 ms | -- | **61.2** |
-| **8192x8192** | -- | 20090.7 ms | -- | **54.7** |
+| Size | OpenBLAS MT | COM6 MT | Ratio | Winner |
+|------|-------------|---------|-------|--------|
+| 512x512 | 33.8 GF | **60.8 GF** | **1.80x** | **COM6** |
+| 1024x1024 | 46.7 GF | **85.5 GF** | **1.83x** | **COM6** |
+| 2048x2048 | 67.2 GF | **70.6 GF** | **1.05x** | **COM6** |
+| 4096x4096 | 42.4 GF | **47.2 GF** | **1.11x** | **COM6** |
+| 8192x8192 | 52.0 GF | **59.7 GF** | **1.15x** | **COM6** |
 
-v62 is a clean rewrite returning to v26's proven 2-tier adaptive blocking after discovering that v28-v61 had blocking parameter regressions (wrong KC/MC for large sizes). v62 adds C-prefetch micro-kernel, 4x unrolled A-packing, dynamic scheduling, and isolated CLI mode.
+**COM6 wins all 5 sizes.** Beats OpenBLAS by 5-83% across all tested sizes. The MC=48 tuning for n<=512 was critical — gives 10+ ic-blocks for 8-thread utilization.
+
+v62 is a clean rewrite returning to v26's proven blocking after discovering v28-v61 had blocking parameter regressions (v61 line 434 used small-size KC for all n>2048). v62 adds C-prefetch micro-kernel, 4x unrolled A-packing, MC=48 for small MT sizes, dynamic scheduling, and isolated CLI mode.
 
 ### v61 vs OpenBLAS MT (fair interleaved comparison, 5s cooling between tests)
 
@@ -67,12 +68,14 @@ v62 is a clean rewrite returning to v26's proven 2-tier adaptive blocking after 
 
 ### Key improvements v62
 
-- **Restored v26 proven blocking** (v62): v28-v61 had blocking regressions (wrong KC/MC for large sizes, e.g. v61 line 434 used KC_SMALL=256 for n>2048 instead of KC_LARGE=320). v62 goes back to v26's proven 2-tier: MC=120/KC=256 for n<=1024, MC=96/KC=320 for n>1024. Both fit L2=256KB (240KB used).
-- **C-output prefetch in micro-kernel** (v61/v62): Prefetches all 6 output rows of C into L1 at the start of the micro-kernel. Uses r15 register to walk C rows before the k-loop begins.
+- **Restored v26 proven blocking** (v62): v28-v61 had blocking regressions (wrong KC/MC for large sizes, e.g. v61 line 434 used KC_SMALL=256 for n>2048 instead of KC_LARGE=320). v62 goes back to proven blocking: MC=48/KC=256 for n<=512, MC=120/KC=256 for n<=1024, MC=96/KC=320 for n>1024. All fit L2=256KB.
+- **MC=48 for small MT** (v62): 512/48=10.7 ic-blocks gives much better 8-thread utilization than 512/120=4.3. This was the key to matching/beating BLAS at 512 (60.8 vs 33.8 GF).
+- **MT threshold lowered** (v62): Multi-threading enabled at n>=512 (was n>512), matching OpenBLAS behavior.
+- **C-output prefetch in micro-kernel** (v61/v62): Prefetches all 6 output rows of C into L1 at the start of the micro-kernel using r15 register.
 - **4x unrolled A-packing** (v60/v62): 24 loads + 24 stores per iteration, halving loop overhead.
 - **Dynamic scheduling** (v62): `schedule(dynamic,1)` for MT loop — better load balance on thermally-throttled cores.
 - **CLI single-size mode** (v62): `./com6_v62 <size> [mt|1t]` for isolated cold-CPU tests.
-- **8192 support**: Tested and working at 8192x8192 (54.7 GF MT).
+- **8192 support**: Tested and working at 8192x8192 (59.7 GF MT).
 
 ### Key improvements v61 (historical)
 
@@ -250,7 +253,7 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | v59 | Always-MT + small-size MC tuning experiments | varies |
 | v60 | 4x A-pack unroll + parallel C-zeroing + streaming B-pack | 42.0 (8192 MT) |
 | **v61** | **C-prefetch micro-kernel + 4-tier blocking + L3-aware KC + MT all sizes — beats BLAS at ALL sizes by 36-147%** | **50.3** (1024 MT), **44.9** (8192 MT), 1.36-2.47x vs BLAS |
-| **v62** | **Clean rewrite: v26 proven blocking + C-prefetch + dynamic scheduling — fixes v28-v61 blocking regressions** | **61.2** (4096 MT), **54.7** (8192 MT), **36.9** (512 1T) |
+| **v62** | **Clean rewrite: v26 blocking + C-prefetch + MC=48 for small MT — fixes v28-v61 regressions, beats BLAS at ALL sizes (1.05-1.83x)** | **85.5** (1024 MT), **60.8** (512 MT), **59.7** (8192 MT) |
 | v63 | NC=1024 for 8192+ (L3-fit experiment) — slower due to extra B-packing overhead | 43.2 (8192 MT) |
 | v64 | JC-parallel (barrier-free MT, each thread owns columns) — slower at 2048 due to duplicated A-packing | 55.5 (4096 MT) |
 
