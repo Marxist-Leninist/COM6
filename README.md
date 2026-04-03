@@ -191,6 +191,11 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | v48 | 8-wide j no-pack kernel (2x ymm per j-iteration) | 50 (256 MT) |
 | **v49** | **Fixed MT load balancing: omp for schedule(static) + MC_TINY for <=1024** | **123.7** (1024 MT), **126.6** (8192 MT) |
 | **v50** | **Distributed prefetch + pack-A prefetch + 4x k-unrolled small path + OMP warmup** | **125.3** (2048 MT), **50.2** (1T 1024) |
+| v51 | NC=2048 for all sizes + C-prefetch in macro_kernel + thermal-aware cooldowns | 122.5 (8192 MT) |
+| v52 | L2-aware NC=128 for n<=512 MT + physical-core threading (experimental) | 91.5 (512 MT) |
+| v53-v54 | Best-of-all: NC=4096 + C-prefetch + cold-first ordering | 73.6 (1024 MT) |
+| **v55** | **Right-sized buffer allocation — eliminates TLB pressure from oversized alloc** | **93.2** (2048 MT), **76.0** (1024 MT) |
+| v56 | NC=2048 everywhere (B-panel fits L3) + C-prefetch + right-sized buffers | 63.4 (2048 MT) |
 
 ## Building
 
