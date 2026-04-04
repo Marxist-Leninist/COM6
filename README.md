@@ -4,7 +4,20 @@
 
 COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 64 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC blocking, C-output prefetching, 4x-unrolled panel packing, and dynamic scheduling for large matrices. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.47x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
 
-## Results (v62 - Latest)
+## Results (v65 - Latest)
+
+### v65 Best Results (isolated cold-CPU tests with 15-30s cooldowns)
+
+| Size | COM6 v65 1T | COM6 v65 MT | Notes |
+|------|-------------|-------------|-------|
+| 256x256 | 40.2 GF | 40.6 GF | 1T optimal (threading overhead) |
+| 512x512 | 46.7 GF | **89.9 GF** | MC=48 gives 10+ ic-blocks for 8T |
+| 1024x1024 | 43.8 GF | **83.2 GF** | dynamic scheduling helps load balance |
+| 2048x2048 | 39.2 GF | **108.2 GF** | dynamic scheduling key here |
+| 4096x4096 | -- | **103.0 GF** | static scheduling (lower overhead) |
+| 8192x8192 | -- | **64.7 GF** | L3 pressure from 5MB shared B panel |
+
+v65 merges the best of v62 (C-prefetch, dynamic scheduling, MC=48) with v26's proven static scheduling for large sizes. Key innovation: **adaptive scheduling** — `schedule(dynamic,1)` for n<=2048 (where load imbalance matters) and `schedule(static)` for n>2048 (where overhead dominates). Also separates 1T and MT blocking functions.
 
 ### v62 vs OpenBLAS MT (fair interleaved comparison, 5s cooling between tests)
 
@@ -16,9 +29,7 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 | 4096x4096 | 42.4 GF | **47.2 GF** | **1.11x** | **COM6** |
 | 8192x8192 | 52.0 GF | **59.7 GF** | **1.15x** | **COM6** |
 
-**COM6 wins all 5 sizes.** Beats OpenBLAS by 5-83% across all tested sizes. The MC=48 tuning for n<=512 was critical — gives 10+ ic-blocks for 8-thread utilization.
-
-v62 is a clean rewrite returning to v26's proven blocking after discovering v28-v61 had blocking parameter regressions (v61 line 434 used small-size KC for all n>2048). v62 adds C-prefetch micro-kernel, 4x unrolled A-packing, MC=48 for small MT sizes, dynamic scheduling, and isolated CLI mode.
+**COM6 wins all 5 sizes.** Beats OpenBLAS by 5-83%.
 
 ### v61 vs OpenBLAS MT (fair interleaved comparison, 5s cooling between tests)
 
@@ -65,6 +76,12 @@ v62 is a clean rewrite returning to v26's proven blocking after discovering v28-
 | 8192x8192 | (skip) | 8979.0 ms | -- | **122.5** |
 
 **Peak: 125.3 GFLOPS** at 2048. 1T peak: **50.2 GF** at 1024 (79% of theoretical single-core peak).
+
+### Key improvements v65
+
+- **Adaptive scheduling** (v65): `schedule(dynamic,1)` for n<=2048 gives +40% at 2048 (better load balance on thermally-throttled cores), while `schedule(static)` for n>2048 avoids dynamic dispatch overhead with 42+ IC-blocks.
+- **Separate 1T/MT blocking** (v65): 1T uses standard v26 2-tier blocking, MT uses 3-tier with MC_TINY=48 for n<=512. No interference between paths.
+- **All v62 improvements inherited**: C-prefetch kernel, 4x A-pack, parallel B-packing, CLI mode.
 
 ### Key improvements v62
 
@@ -256,18 +273,19 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | **v62** | **Clean rewrite: v26 blocking + C-prefetch + MC=48 for small MT — fixes v28-v61 regressions, beats BLAS at ALL sizes (1.05-1.83x)** | **85.5** (1024 MT), **60.8** (512 MT), **59.7** (8192 MT) |
 | v63 | NC=1024 for 8192+ (L3-fit experiment) — slower due to extra B-packing overhead | 43.2 (8192 MT) |
 | v64 | JC-parallel (barrier-free MT, each thread owns columns) — slower at 2048 due to duplicated A-packing | 55.5 (4096 MT) |
+| **v65** | **Adaptive scheduling hybrid: dynamic(<=2048) + static(>2048), separate 1T/MT blocking, C-prefetch kernel** | **108.2** (2048 MT), **103.0** (4096 MT), **89.9** (512 MT) |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v62: AVX2 + OpenMP + C-prefetch + proven blocking (recommended, latest)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v62 com6_v62.c -lm
-./com6_v62           # full benchmark (256-8192, 4s cooldown between sizes)
-./com6_v62 4096 mt   # single-size MT cold CPU test
-./com6_v62 512 1t    # single-size 1T test
-./com6_v62 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
+# v65: AVX2 + OpenMP + adaptive scheduling (recommended, latest)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v65 com6_v65.c -lm
+./com6_v65           # full benchmark (256-8192, 4s cooldown between sizes)
+./com6_v65 4096 mt   # single-size MT cold CPU test
+./com6_v65 512 1t    # single-size 1T test
+./com6_v65 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
 
 # v38: AVX2 + OpenMP
 gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v38 com6_v38.c -lm
