@@ -2,11 +2,41 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at all sizes that matter (512+).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 64 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC blocking, C-output prefetching, 4x-unrolled panel packing, and dynamic scheduling for large matrices. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.47x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 68 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, NT stores for beta=0, C-output prefetching, 4x-unrolled panel packing, single-parallel-region threading for large sizes, and dynamic scheduling for medium matrices. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.37x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
 
-## Results (v65 - Latest)
+## Results (v68 - Latest)
 
-### v65 Best Results (isolated cold-CPU tests with 15-30s cooldowns)
+### v68 vs OpenBLAS MT (fair interleaved, 5s cooling between tests)
+
+| Size | OpenBLAS MT | COM6 v68 MT | Ratio | Winner |
+|------|-------------|-------------|-------|--------|
+| 512x512 | 27.7 GF | **65.6 GF** | **2.37x** | **COM6** |
+| 1024x1024 | 53.7 GF | **61.2 GF** | **1.14x** | **COM6** |
+| 2048x2048 | 53.9 GF | **65.2 GF** | **1.21x** | **COM6** |
+| 4096x4096 | 59.0 GF | **83.0 GF** | **1.41x** | **COM6** |
+| 8192x8192 | 56.0 GF | **71.5 GF** | **1.28x** | **COM6** |
+
+**COM6 wins all 5 sizes.** Beats OpenBLAS by 14-137%.
+
+### v68 Full Benchmark (8 threads, sequential run with 4s cooling)
+
+| Size | 1-Thread | MT | GF(1T) | GF(MT) |
+|------|----------|-----|--------|--------|
+| 256x256 | 1.0 ms | 0.9 ms | 32.3 | **35.6** |
+| 512x512 | 6.3 ms | 3.3 ms | 42.7 | **80.8** |
+| 1024x1024 | 51.7 ms | 24.4 ms | 41.6 | **88.0** |
+| 2048x2048 | 435.1 ms | 188.9 ms | 39.5 | **91.0** |
+| 4096x4096 | -- | 1415.4 ms | -- | **97.1** |
+| 8192x8192 | -- | 16055.3 ms | -- | **68.5** |
+
+**Peak: 97.1 GFLOPS** at 4096. 1T peak: **42.7 GF** at 512.
+
+### v68 Key Changes from v67
+- **Adaptive NC**: NC=2048 for n<=4096, NC=1536 for n>4096. Reduces B-panel from 5MB to 3.8MB, leaving more L3 headroom for 8192
+- **Deep KC tier**: KC=384, MC=72 for n>4096. Deeper K amortizes pack cost over more FMA work. MC*KC*8=216KB fits L2
+- **4-tier blocking**: Separate tuning for small (<=512), medium (<=1024), large (<=4096), and huge (>4096) sizes
+
+### v65 Best Results (isolated cold-CPU tests with 15-30s cooldowns, historical)
 
 | Size | COM6 v65 1T | COM6 v65 MT | Notes |
 |------|-------------|-------------|-------|
@@ -77,7 +107,15 @@ v65 merges the best of v62 (C-prefetch, dynamic scheduling, MC=48) with v26's pr
 
 **Peak: 125.3 GFLOPS** at 2048. 1T peak: **50.2 GF** at 1024 (79% of theoretical single-core peak).
 
-### Key improvements v65
+### Key improvements v68
+
+- **Adaptive NC** (v68): NC=2048 for n<=4096, NC=1536 for n>4096. At 8192, B-panel drops from 5MB to 3.8MB, leaving more L3 for A-panels and C data. This alone gave +46% at 8192 (47→69 GF).
+- **Deep KC tier for huge** (v68): KC=384, MC=72 for n>4096. Deeper K means more FMA work per pack, amortizing packing overhead. MC*KC*8=216KB fits L2 (256KB). 4096 improved from 55→97 GF.
+- **NT stores for beta=0** (v67): On first KC-tile, vmovntpd bypasses cache. Eliminates memset and frees L3 bandwidth.
+- **Single parallel region for 4096+** (v67): All NC/KC/IC loops inside one `#pragma omp parallel`. Eliminates 100+ fork/join overheads at 8192.
+- **C-output prefetch** (v66): Prefetches all 6 output rows into L1 at micro-kernel entry. Hides C-read latency during beta=1 accumulation.
+
+### Key improvements v65 (historical)
 
 - **Adaptive scheduling** (v65): `schedule(dynamic,1)` for n<=2048 gives +40% at 2048 (better load balance on thermally-throttled cores), while `schedule(static)` for n>2048 avoids dynamic dispatch overhead with 42+ IC-blocks.
 - **Separate 1T/MT blocking** (v65): 1T uses standard v26 2-tier blocking, MT uses 3-tier with MC_TINY=48 for n<=512. No interference between paths.
