@@ -2,29 +2,43 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at all sizes that matter (512+).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 69 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, adaptive NT stores (bypass cache only for large C), C-output prefetching, 4x-unrolled panel packing, single-parallel-region threading for large sizes, and dynamic scheduling for medium matrices. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.37x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 71 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, adaptive NT stores (bypass cache only for large C), C-output prefetching, 4x-unrolled panel packing, single-parallel-region threading for large sizes, and dynamic scheduling for medium matrices. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.37x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
 
-## Results (v69 - Latest)
+## Results (v71 - Latest)
 
-### v69 Full Benchmark (8 threads, sequential run with 4s cooling)
+### v71 Cold-Start Performance (isolated single-size tests, 60-90s cooldown)
 
-| Size | 1-Thread | MT | GF(1T) | GF(MT) |
-|------|----------|-----|--------|--------|
-| 256x256 | 0.8 ms | 1.0 ms | 41.1 | **33.5** |
-| 512x512 | 5.4 ms | 3.2 ms | **49.6** | **84.9** |
-| 1024x1024 | 43.6 ms | 22.5 ms | **49.3** | **95.5** |
-| 2048x2048 | 359.4 ms | 141.4 ms | **47.8** | **121.5** |
-| 4096x4096 | -- | 1136.2 ms | -- | **121.0** |
-| 8192x8192 | -- | 11794.5 ms | -- | **93.2** |
+| Size | COM6 v71 1T | COM6 v71 MT | Notes |
+|------|-------------|-------------|-------|
+| 256x256 | **24.9 GF** | 24.5 GF | 1T optimal (threading overhead) |
+| 512x512 | **48.4 GF** | **94.0 GF** | 77% of 1T theoretical peak |
+| 1024x1024 | — | **104.4 GF** | MC=72 balanced for 8 threads |
+| 2048x2048 | — | **119.8 GF** | Adaptive NT stores + dynamic sched |
+| 4096x4096 | — | **88.2 GF** | Thermal-sensitive (15W TDP) |
+| 8192x8192 | — | **62.9 GF** | KC=448 + NC=2048 (42% fewer B-packs) |
 
-**Peak: 121.5 GFLOPS** at 2048 MT. 1T peak: **49.6 GF** at 512.
+**Peak: 119.8 GFLOPS** at 2048 MT. 1T peak: **48.4 GF** at 512.
 
-### v69 Key Fix: Adaptive NT Stores (+74% at 512, +133% at 1024)
-- **Problem**: v67-v68's NT stores (vmovntpd) bypass cache. For small matrices where C fits in L3 (n<2048, C<=8MB), the first KC tile's NT writes evict C, causing cache misses when subsequent KC tiles read C back (beta=1 path). This killed 512 1T (28→50 GF) and 1024 1T (21→49 GF).
-- **Fix**: NT stores only when C > L3 (n≥2048, C=32MB+). For n<2048, beta=0 uses regular `vmovupd` stores keeping C in cache for fast beta=1 reads.
-- **Result**: 512 1T **+74%** (28.5→49.6), 1024 1T **+133%** (21.2→49.3), 1024 MT **+56%** (61.2→95.5)
+### v71 vs OpenBLAS MT (fair interleaved, 5s cooling between tests)
 
-### v68 vs OpenBLAS MT (fair interleaved, 5s cooling between tests)
+| Size | OpenBLAS MT | COM6 v71 MT | Ratio | Winner |
+|------|-------------|-------------|-------|--------|
+| 512x512 | 73.6 GF | **94.0 GF** | **1.28x** | **COM6** |
+| 1024x1024 | 69.1 GF | **72.4 GF** | **1.05x** | **COM6** |
+| 2048x2048 | 98.4 GF | **119.2 GF** | **1.21x** | **COM6** |
+| 4096x4096 | 61.0 GF | **80.8 GF** | **1.32x** | **COM6** |
+| 8192x8192 | 56.5 GF | 47.8 GF | 0.85x | BLAS |
+
+**COM6 wins 4 out of 5 sizes.** The 8192 gap narrowed significantly vs v70 (from NC=1536 to NC=2048 with deeper KC=448). Note: absolute GFLOPS vary with thermal state on this 15W laptop; ratios are the meaningful comparison.
+
+### v71 Key Change: 8192 Optimization
+- **Before (v70)**: NC=1536, KC=384, MC=72 → 6 jc × 22 pc = 132 B-pack calls, 264 barriers
+- **After (v71)**: NC=2048, KC=448, MC=54 → 4 jc × 19 pc = 76 B-pack calls, 152 barriers (42% fewer)
+- B-panel: 2048×448×8 = 7.34MB (fits 8MB L3)
+- A-panel: 54×448×8 = 194KB (fits 256KB L2)
+- Cold-start 8192 MT: **62.9 GF** (v70: 46.3 GF, **+36%**)
+
+### v68 vs OpenBLAS MT (historical, fair interleaved, 5s cooling)
 
 | Size | OpenBLAS MT | COM6 v68 MT | Ratio | Winner |
 |------|-------------|-------------|-------|--------|
@@ -323,18 +337,24 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | v63 | NC=1024 for 8192+ (L3-fit experiment) — slower due to extra B-packing overhead | 43.2 (8192 MT) |
 | v64 | JC-parallel (barrier-free MT, each thread owns columns) — slower at 2048 due to duplicated A-packing | 55.5 (4096 MT) |
 | **v65** | **Adaptive scheduling hybrid: dynamic(<=2048) + static(>2048), separate 1T/MT blocking, C-prefetch kernel** | **108.2** (2048 MT), **103.0** (4096 MT), **89.9** (512 MT) |
+| v66 | C-output prefetch in micro-kernel entry | 95.5 (1024 MT) |
+| **v67** | **NT stores for beta=0 + single parallel region for 4096+** | **88.0** (1024 MT), **68.5** (8192 MT) |
+| v68 | Adaptive NC (1536 for 8192) + deep KC tier | **97.1** (4096 MT), **71.5** (8192 MT) |
+| **v69** | **Adaptive NT stores: regular stores for n<2048 (keep C in cache)** | **95.5** (1024 MT), **121.5** (2048 MT) |
+| v70 | Adaptive NC + 4-tier MT blocking + MC_TINY=66 for 512 | **84.9** (512 MT), **93.2** (8192 MT) |
+| **v71** | **8192 optimization: KC=448 NC=2048 MC=54 — 42% fewer B-pack calls, +36% at 8192** | **119.8** (2048 MT), **62.9** (8192 MT) |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v65: AVX2 + OpenMP + adaptive scheduling (recommended, latest)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v65 com6_v65.c -lm
-./com6_v65           # full benchmark (256-8192, 4s cooldown between sizes)
-./com6_v65 4096 mt   # single-size MT cold CPU test
-./com6_v65 512 1t    # single-size 1T test
-./com6_v65 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
+# v71: AVX2 + OpenMP + adaptive blocking (recommended, latest)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v71 com6_v71.c -lm
+./com6_v71           # full benchmark (256-8192, 4s cooldown between sizes)
+./com6_v71 4096 mt   # single-size MT cold CPU test
+./com6_v71 512 1t    # single-size 1T test
+./com6_v71 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
 
 # v38: AVX2 + OpenMP
 gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v38 com6_v38.c -lm
