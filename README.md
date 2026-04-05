@@ -2,33 +2,43 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at all sizes that matter (512+).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 73 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, adaptive NT stores (bypass cache only for large C), C-output prefetching, 4x-unrolled panel packing, single-parallel-region threading for large sizes, and branch-free micro-kernel. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.37x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 75 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 4x-unrolled panel packing, single-parallel-region threading for large sizes, and branch-free micro-kernels. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.37x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
 
-## Results (v73 - Latest)
+## Results (v75 - Latest)
 
-### v73 Full Benchmark (30s cooldown between sizes)
+### v75 Full Benchmark (90s cooldown, sequential)
 
-| Size | GF(1T) | GF(MT) |
-|------|--------|--------|
-| 256x256 | 26.7 | 22.9 |
-| 512x512 | 22.8 | **65.9** |
-| 1024x1024 | 17.3 | **48.8** |
-| 2048x2048 | 28.7 | **84.4** |
-| 4096x4096 | — | **65.7** |
-| 8192x8192 | — | **71.5** |
+| Size | GF(1T) | GF(MT) | Verify |
+|------|--------|--------|--------|
+| 256x256 | 27.0 | 25.1 | OK |
+| 512x512 | 43.7 | **80.7** | OK |
+| 1024x1024 | 38.1 | **106.4** | OK |
+| 2048x2048 | 34.6 | **88.1** | OK |
+| 4096x4096 | — | **80.8** | OK |
+| 8192x8192 | — | **83.6** | OK |
 
-**Peak: 84.4 GFLOPS** at 2048 MT. Note: absolute GFLOPS vary ±25-50% with thermal state on 15W TDP; v73's back-to-back wins at 512 and 1024 MT (+17% and +37% over v72) demonstrate the real improvement from MT-specific blocking.
+**Peak: 106.4 GFLOPS** at 1024 MT. Note: absolute GFLOPS vary ±25-50% with thermal state on 15W TDP.
+
+### v75 Key Changes: NT Stores for Large Beta=0
+- **Three micro-kernel variants**: `micro_6x8_beta1` (load+add+store), `micro_6x8_beta0` (just store), `micro_6x8_beta0_nt` (non-temporal store)
+- **NT stores for n>=2048**: `vmovntpd` bypasses cache on first KC tile, avoiding RFO overhead. At 8192, C=512MB — NT stores keep L3 free for A/B panels.
+- **Kernel selection at macro_kernel call site**: No branching INSIDE any kernel — all three variants are branch-free.
+- 8192 back-to-back: v75 86.5 GF vs v74 82.5 GF (+5%)
+
+### v74 Key Changes: Memset Elimination (Two-Kernel Beta)
+- **No more memset**: Eliminated `memset(C, 0, n*n*8)` — saves bandwidth for zeroing entire C matrix.
+- **Two kernel variants**: `micro_6x8_beta0` (first KC tile, just stores) and `micro_6x8_beta1` (subsequent KC tiles, load+add+store).
+- **Branch at call site, not in kernel**: macro_kernel passes beta to select variant — still branch-free inside.
+- 8192 back-to-back: v74 51.6 GF vs v73 43.5 GF (+19%)
 
 ### v73 Key Changes: Branch-Free Kernel + MT-Specific Blocking
-- **Branch-free micro-kernel** (from v24): Always load+add+store — no runtime beta/NT branching. Eliminates branch misprediction overhead.
+- **Branch-free micro-kernel** (from v24): No runtime beta/NT branching inside the FMA loop.
 - **Separate 1T/MT blocking functions**: 1T uses larger MC for better L2 utilization; MT uses smaller MC for better thread distribution.
-- **MC_MT_SMALL=48 for n<=1024 MT**: 512/48=11 ic-tiles for 8 threads (vs 512/120=5 in 1T). Thread distribution matters more than per-thread L2 utilization for MT.
-- **3-tier adaptive blocking**: SMALL (n<=1024), LARGE (n<=4096), HUGE (n>=8192) with separate KC/MC/NC per tier.
-- **Back-to-back wins vs v72**: 512 MT 63.3 vs 54.1 GF (+17%), 1024 MT 74.7 vs 54.4 GF (+37%).
+- **MC_MT_SMALL=48 for n<=1024 MT**: 512/48=11 ic-tiles for 8 threads (vs 512/120=5 in 1T).
+- **Back-to-back wins vs v72**: 512 MT +17%, 1024 MT +37%.
 
 ### v72 Key Changes: Branch-Free Kernel Restoration
-- Merged v24's proven branch-free micro-kernel with v69's framework improvements (adaptive blocking, 4x A-pack, CLI mode, 8192 support, cooldowns).
-- Eliminated the beta/NT branching from v67-v71 that added complexity without measurable benefit on this platform.
+- Merged v24's proven branch-free micro-kernel with v69's framework improvements.
 - 3-tier blocking: KC=256/MC=120 (SMALL), KC=320/MC=96 (LARGE), KC=384/MC=72/NC=1536 (HUGE).
 - Single parallel region for n>=4096.
 
@@ -371,18 +381,20 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | **v71** | **8192 optimization: KC=448 NC=2048 MC=54 — 42% fewer B-pack calls, +36% at 8192** | **119.8** (2048 MT), **62.9** (8192 MT) |
 | **v72** | **Branch-free kernel restoration (v24 kernel) + 3-tier adaptive blocking + 4x A-pack + 8192** | **63.8** (2048 MT), **56.9** (512 MT) |
 | **v73** | **MT-specific blocking: MC=48 for small MT gives +17% at 512, +37% at 1024 vs v72** | **84.4** (2048 MT), **71.5** (8192 MT) |
+| **v74** | **Memset elimination: beta0/beta1 two-kernel split, no memset needed — +19% at 8192** | **79.8** (8192 MT), **88.6** (1024 MT) |
+| **v75** | **NT stores for large beta=0: vmovntpd bypasses cache for n>=2048 — +5% at 8192** | **106.4** (1024 MT), **83.6** (8192 MT) |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v73: AVX2 + OpenMP + branch-free kernel + MT-specific blocking (recommended, latest)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v73 com6_v73.c -lm
-./com6_v73           # full benchmark (256-8192, 30s cooldown between sizes)
-./com6_v73 4096 mt   # single-size MT cold CPU test
-./com6_v73 512 1t    # single-size 1T test
-./com6_v73 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
+# v75: AVX2 + OpenMP + 3-kernel beta + NT stores + MT-specific blocking (recommended, latest)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v75 com6_v75.c -lm
+./com6_v75           # full benchmark (256-8192, 4s cooldown between sizes)
+./com6_v75 4096 mt   # single-size MT cold CPU test
+./com6_v75 512 1t    # single-size 1T test
+./com6_v75 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
 
 # v38: AVX2 + OpenMP
 gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v38 com6_v38.c -lm
