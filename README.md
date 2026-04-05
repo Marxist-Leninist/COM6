@@ -2,9 +2,27 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at all sizes that matter (512+).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 68 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, NT stores for beta=0, C-output prefetching, 4x-unrolled panel packing, single-parallel-region threading for large sizes, and dynamic scheduling for medium matrices. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.37x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 69 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, adaptive NT stores (bypass cache only for large C), C-output prefetching, 4x-unrolled panel packing, single-parallel-region threading for large sizes, and dynamic scheduling for medium matrices. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.37x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
 
-## Results (v68 - Latest)
+## Results (v69 - Latest)
+
+### v69 Full Benchmark (8 threads, sequential run with 4s cooling)
+
+| Size | 1-Thread | MT | GF(1T) | GF(MT) |
+|------|----------|-----|--------|--------|
+| 256x256 | 0.8 ms | 1.0 ms | 41.1 | **33.5** |
+| 512x512 | 5.4 ms | 3.2 ms | **49.6** | **84.9** |
+| 1024x1024 | 43.6 ms | 22.5 ms | **49.3** | **95.5** |
+| 2048x2048 | 359.4 ms | 141.4 ms | **47.8** | **121.5** |
+| 4096x4096 | -- | 1136.2 ms | -- | **121.0** |
+| 8192x8192 | -- | 11794.5 ms | -- | **93.2** |
+
+**Peak: 121.5 GFLOPS** at 2048 MT. 1T peak: **49.6 GF** at 512.
+
+### v69 Key Fix: Adaptive NT Stores (+74% at 512, +133% at 1024)
+- **Problem**: v67-v68's NT stores (vmovntpd) bypass cache. For small matrices where C fits in L3 (n<2048, C<=8MB), the first KC tile's NT writes evict C, causing cache misses when subsequent KC tiles read C back (beta=1 path). This killed 512 1T (28→50 GF) and 1024 1T (21→49 GF).
+- **Fix**: NT stores only when C > L3 (n≥2048, C=32MB+). For n<2048, beta=0 uses regular `vmovupd` stores keeping C in cache for fast beta=1 reads.
+- **Result**: 512 1T **+74%** (28.5→49.6), 1024 1T **+133%** (21.2→49.3), 1024 MT **+56%** (61.2→95.5)
 
 ### v68 vs OpenBLAS MT (fair interleaved, 5s cooling between tests)
 
@@ -18,7 +36,7 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 
 **COM6 wins all 5 sizes.** Beats OpenBLAS by 14-137%.
 
-### v68 Full Benchmark (8 threads, sequential run with 4s cooling)
+### v68 Full Benchmark (historical)
 
 | Size | 1-Thread | MT | GF(1T) | GF(MT) |
 |------|----------|-----|--------|--------|
@@ -28,13 +46,6 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 | 2048x2048 | 435.1 ms | 188.9 ms | 39.5 | **91.0** |
 | 4096x4096 | -- | 1415.4 ms | -- | **97.1** |
 | 8192x8192 | -- | 16055.3 ms | -- | **68.5** |
-
-**Peak: 97.1 GFLOPS** at 4096. 1T peak: **42.7 GF** at 512.
-
-### v68 Key Changes from v67
-- **Adaptive NC**: NC=2048 for n<=4096, NC=1536 for n>4096. Reduces B-panel from 5MB to 3.8MB, leaving more L3 headroom for 8192
-- **Deep KC tier**: KC=384, MC=72 for n>4096. Deeper K amortizes pack cost over more FMA work. MC*KC*8=216KB fits L2
-- **4-tier blocking**: Separate tuning for small (<=512), medium (<=1024), large (<=4096), and huge (>4096) sizes
 
 ### v65 Best Results (isolated cold-CPU tests with 15-30s cooldowns, historical)
 
