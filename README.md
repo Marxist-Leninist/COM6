@@ -2,9 +2,9 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at all sizes that matter (512+).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 77 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 2x-unrolled B-panel packing, 4x-unrolled A-panel packing, single-parallel-region threading for large sizes, and branch-free micro-kernels. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 1.42x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 79 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 2x-unrolled B-panel packing, 4x-unrolled A-panel packing, single-parallel-region threading for large sizes, and branch-free micro-kernels. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 1.42x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
 
-## Results (v77 - Latest)
+## Results (v79 - Latest)
 
 ### v77 vs OpenBLAS MT (cold-start, 5s cooldown between sizes)
 
@@ -18,18 +18,25 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 
 **COM6 wins ALL 5 sizes.** Peak: **129.4 GFLOPS** at 2048 MT, **128.5 GFLOPS** at 8192 MT.
 
-### v77 Cold-Start Performance (isolated single-size tests, 10-15s cooldown)
+### v79 vs v77 Individual Tests (15-30s cooldown per test)
 
-| Size | GF(1T) | GF(MT) |
-|------|--------|--------|
-| 256x256 | **37.8** | 35.6 |
-| 512x512 | 45.3 | **100.5** |
-| 1024x1024 | 48.2 | **121.0** |
-| 2048x2048 | 35.9 | **128.5** |
-| 4096x4096 | — | **126.1** |
-| 8192x8192 | — | **119.1** |
+| Size | v77 MT | v79 MT | Change |
+|------|--------|--------|--------|
+| 1024x1024 | 92.4 GF | **98.1 GF** | +6% |
+| 2048x2048 | 90.8 GF | **91.9 GF** | +1% |
+| 4096x4096 | 86.2 GF | **93.0 GF** | +8% |
+| 8192x8192 | 74.9 GF | **83.8 GF** | **+12%** |
+
+v79 wins at all sizes. The 8192 improvement comes from deeper KC=768 reducing C-passes from 16 to 11.
 
 Note: absolute GFLOPS vary ±25-50% with thermal state on 15W TDP. Ratios vs OpenBLAS are the meaningful comparison.
+
+### v79 Key Changes: Deep KC for Fewer C-Passes
+- **KC_HUGE=768 for 8192+**: 8192/768=11 C-passes (was 16 with KC=512, **31% fewer**).
+  - Each C-pass is a full DRAM round-trip on the output matrix. Fewer passes = dramatically less DRAM traffic.
+- **MC_HUGE=30**: 30*768*8=184KB (fits 256KB L2 with 72KB headroom for B-panel slice).
+- **NC_HUGE=1024**: B-panel=1024*768*8=6.3MB (fits 8MB shared L3 with room for 8 threads' A-panels).
+- **8192/30=274 ic-blocks**: 34 per thread at 8T — good load balance with dynamic scheduling.
 
 ### v77 Key Changes: 2x B-Pack Unroll + Static Scheduling
 - **2x k-unrolled B-packing**: Process 2 rows per iteration in full NR=8 panels, doubling throughput and halving loop overhead.
