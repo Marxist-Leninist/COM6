@@ -1,4 +1,4 @@
-"""COM6 v62 vs OpenBLAS — Fair interleaved comparison
+"""COM6 v80 vs OpenBLAS — Fair interleaved comparison
 Tests both at each size with cooling to equalize thermal conditions."""
 import numpy as np
 import time
@@ -49,11 +49,11 @@ def bench_com6_single(exe, n, mode="mt"):
 
 if __name__ == "__main__":
     sizes = [512, 1024, 2048, 4096, 8192]
-    exe = "C:/Users/Scott/com6-matmul/com6_v68.exe"
+    exe = "C:/Users/Scott/com6_v80.exe"
 
     print("=" * 80)
-    print("  COM6 v68 vs OpenBLAS (numpy) -- Fair Interleaved Comparison")
-    print("  (5s cooling between each test)")
+    print("  COM6 v80 vs OpenBLAS (numpy) -- Fair Interleaved Comparison")
+    print("  (10s cooling between each test)")
     print("=" * 80)
     print()
     print(f"{'Size':<10} | {'BLAS MT':>8} | {'COM6 MT':>8} | {'Ratio':>8} | {'Winner':>10}")
@@ -61,9 +61,9 @@ if __name__ == "__main__":
 
     for n in sizes:
         print(f"  Testing {n}...", end='', flush=True)
-        time.sleep(5)
+        time.sleep(10)
         blas_gf = bench_openblas_single(n, 8)
-        time.sleep(5)
+        time.sleep(10)
         com6_gf = bench_com6_single(exe, n)
         ratio = com6_gf / blas_gf if blas_gf > 0 else 0
         winner = "COM6 WIN" if ratio > 1 else "BLAS win"
