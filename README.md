@@ -2,9 +2,29 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication at 1024+ sizes.**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 80 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 2x-unrolled B-panel packing, 4x-unrolled A-panel packing, universal persistent-thread-pool (single fork-join for all sizes), and branch-free micro-kernels.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 84 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, OpenMP parallelization with 4-tier adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 2x-unrolled B-panel packing, 4x-unrolled A-panel packing with software prefetch, universal persistent-thread-pool (single fork-join for all sizes), and branch-free micro-kernels.
 
-## Results (v80 - Latest)
+## Results (v84 - Latest)
+
+### v83 Full Benchmark (sequential with 4s cooldowns)
+
+| Size | 1-Thread | MT (8T) | GF(1T) | GF(MT) |
+|------|----------|---------|--------|--------|
+| 256x256 | 0.9 ms | 0.9 ms | 35.5 | 38.1 |
+| 512x512 | 6.6 ms | 4.5 ms | 40.9 | **60.2** |
+| 1024x1024 | 43.7 ms | 17.8 ms | 49.1 | **120.8** |
+| 2048x2048 | 384.6 ms | 138.4 ms | 44.7 | **124.1** |
+| 4096x4096 | -- | 1307.8 ms | -- | **105.1** |
+| 8192x8192 | -- | 12777.1 ms | -- | **86.1** |
+
+**Peak: 124.1 GFLOPS** at 2048 MT (8 threads). 1T peak: **49.1 GF** at 1024.
+
+### v84 Key Changes: L3-Aware Blocking + Prefetch A-Packing
+- **4-tier blocking**: Small (n<=1024), Medium (n<=2048), Large (n<=4096 with NC=1024), Huge (n>=8192).
+- **Retuned 8192 blocking**: KC=768/MC=30/NC=768 (B-panel=4.7MB, 59% L3). KC=1024 thrashed L3 — measured 52 GF vs 86 GF.
+- **NC=1024 for 4096**: B-panel = 320*1024*8 = 2.6MB (32% L3) instead of 5.2MB.
+- **Prefetch-ahead in A-packing**: Software prefetch 8 columns ahead for large KC values.
+- **Three micro-kernel variants**: beta0 (store), beta1 (load+add+store with C-prefetch), beta0-NT (non-temporal store for large C).
 
 ### v80 vs OpenBLAS MT (fair interleaved, 10s cooldown between tests)
 
@@ -20,22 +40,9 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 
 Note: absolute GFLOPS vary wildly (up to 2x) with thermal state on 15W TDP laptop. Ratios vs OpenBLAS are the meaningful comparison — both are equally affected by thermal throttle.
 
-### v80 Full Benchmark (sequential with 4s cooldowns)
-
-| Size | 1-Thread | MT (8T) | GF(1T) | GF(MT) |
-|------|----------|---------|--------|--------|
-| 256x256 | 0.9 ms | 0.9 ms | 39.0 | 36.5 |
-| 512x512 | 5.9 ms | 3.5 ms | 45.5 | **76.1** |
-| 1024x1024 | 47.1 ms | 19.4 ms | 45.6 | **110.7** |
-| 2048x2048 | 512.2 ms | 154.5 ms | 33.5 | **111.2** |
-| 4096x4096 | -- | 1407.2 ms | -- | **97.7** |
-| 8192x8192 | -- | 15340.6 ms | -- | **71.7** |
-
 ### v80 Key Changes: Universal Persistent Thread Pool
 - **Single parallel region for ALL MT sizes**: v79 only did this for n>=4096. v80 does it universally, eliminating repeated fork-join overhead.
-- **Deep KC=768 for 8192+**: 8192/768=11 C-passes. Each C-pass is a full DRAM round-trip — fewer passes = less DRAM traffic.
-- **MC_HUGE=30**: 30*768*8=184KB (fits 256KB L2 with headroom).
-- **NC_HUGE=1024**: B-panel=1024*768*8=6.3MB (fits 8MB shared L3).
+- **Deep KC for 8192+**: Minimize C-passes (DRAM round-trips).
 - **Three micro-kernel variants**: beta0 (store), beta1 (load+add+store with C-prefetch), beta0-NT (non-temporal store for large C).
 
 ### v77 Key Changes: 2x B-Pack Unroll + Static Scheduling
