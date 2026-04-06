@@ -2,28 +2,41 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication — at all sizes that matter (512+).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 75 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 4x-unrolled panel packing, single-parallel-region threading for large sizes, and branch-free micro-kernels. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 2.37x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 77 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8 + AVX-512 6x16), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 2x-unrolled B-panel packing, 4x-unrolled A-panel packing, single-parallel-region threading for large sizes, and branch-free micro-kernels. COM6 beats OpenBLAS at ALL tested sizes on Intel Comet Lake (up to 1.42x faster) and scales to 255 GFLOPS with AVX-512 on Xeon.
 
-## Results (v75 - Latest)
+## Results (v77 - Latest)
 
-### v75 Full Benchmark (90s cooldown, sequential)
+### v77 vs OpenBLAS MT (cold-start, 5s cooldown between sizes)
 
-| Size | GF(1T) | GF(MT) | Verify |
-|------|--------|--------|--------|
-| 256x256 | 27.0 | 25.1 | OK |
-| 512x512 | 43.7 | **80.7** | OK |
-| 1024x1024 | 38.1 | **106.4** | OK |
-| 2048x2048 | 34.6 | **88.1** | OK |
-| 4096x4096 | — | **80.8** | OK |
-| 8192x8192 | — | **83.6** | OK |
+| Size | OpenBLAS MT | COM6 v77 MT | Ratio | Winner |
+|------|-------------|-------------|-------|--------|
+| 512x512 | 83.4 GF | **94.5 GF** | **1.13x** | **COM6** |
+| 1024x1024 | 81.2 GF | **115.7 GF** | **1.42x** | **COM6** |
+| 2048x2048 | 114.0 GF | **129.4 GF** | **1.14x** | **COM6** |
+| 4096x4096 | 112.1 GF | **123.9 GF** | **1.11x** | **COM6** |
+| 8192x8192 | 108.7 GF | **128.5 GF** | **1.18x** | **COM6** |
 
-**Peak: 106.4 GFLOPS** at 1024 MT. Note: absolute GFLOPS vary ±25-50% with thermal state on 15W TDP.
+**COM6 wins ALL 5 sizes.** Peak: **129.4 GFLOPS** at 2048 MT, **128.5 GFLOPS** at 8192 MT.
 
-### v75 Key Changes: NT Stores for Large Beta=0
-- **Three micro-kernel variants**: `micro_6x8_beta1` (load+add+store), `micro_6x8_beta0` (just store), `micro_6x8_beta0_nt` (non-temporal store)
-- **NT stores for n>=2048**: `vmovntpd` bypasses cache on first KC tile, avoiding RFO overhead. At 8192, C=512MB — NT stores keep L3 free for A/B panels.
-- **Kernel selection at macro_kernel call site**: No branching INSIDE any kernel — all three variants are branch-free.
-- 8192 back-to-back: v75 86.5 GF vs v74 82.5 GF (+5%)
+### v77 Cold-Start Performance (isolated single-size tests, 10-15s cooldown)
+
+| Size | GF(1T) | GF(MT) |
+|------|--------|--------|
+| 256x256 | **37.8** | 35.6 |
+| 512x512 | 45.3 | **100.5** |
+| 1024x1024 | 48.2 | **121.0** |
+| 2048x2048 | 35.9 | **128.5** |
+| 4096x4096 | — | **126.1** |
+| 8192x8192 | — | **119.1** |
+
+Note: absolute GFLOPS vary ±25-50% with thermal state on 15W TDP. Ratios vs OpenBLAS are the meaningful comparison.
+
+### v77 Key Changes: 2x B-Pack Unroll + Static Scheduling
+- **2x k-unrolled B-packing**: Process 2 rows per iteration in full NR=8 panels, doubling throughput and halving loop overhead.
+- **Single parallel region for n>=4096**: Eliminates fork/join overhead between tiles (from v76).
+- **Deep KC=512 for 8192+**: 8192/512 = 16 C-passes (27% fewer than KC=384).
+- **Three micro-kernel variants**: beta0 (store), beta1 (load+add+store), beta0-NT (non-temporal store).
+- **C-prefetch in beta1 kernel**: Prefetches all 6 C rows before k-loop starts.
 
 ### v74 Key Changes: Memset Elimination (Two-Kernel Beta)
 - **No more memset**: Eliminated `memset(C, 0, n*n*8)` — saves bandwidth for zeroing entire C matrix.
