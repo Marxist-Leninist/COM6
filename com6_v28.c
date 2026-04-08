@@ -1,14 +1,15 @@
 /*
- * COM6 v28 - Pure BLIS at Scale (No Strassen)
- * =============================================
- * Strassen hurt on this platform (copy overhead > 12.5% FLOP savings).
- * This is v26's adaptive BLIS + 8x unrolled ASM applied to all sizes.
+ * COM6 v26 - Adaptive Cache Blocking + 8x Unrolled ASM
+ * =====================================================
+ * Merges v24 and v25: uses different KC/MC for different matrix sizes.
+ * - n<=1024: KC=256, MC=120 (v24 tuning, best for small)
+ * - n>1024:  KC=320, MC=96  (v25 tuning, best for large — 115 GFLOPS)
  *
- * Smart benchmark: skips 1T for huge sizes to prevent thermal throttling
- * from contaminating the MT results.
+ * Both fit L2: 120*256*8=240KB, 96*320*8=240KB (L2=256KB)
+ * Deeper KC amortizes B-packing cost over more FMA work per panel.
  *
  * Compile:
- *   gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -static -o com6_v28 com6_v28.c -lm
+ *   gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -static -o com6_v26 com6_v26.c -lm
  */
 
 #include <immintrin.h>
@@ -26,6 +27,7 @@
 #define NC  2048
 #define ALIGN 64
 
+/* Adaptive blocking */
 #define KC_SMALL 256
 #define MC_SMALL 120
 #define KC_LARGE 320
@@ -361,8 +363,8 @@ static void pack_A(const double*__restrict__ A,double*__restrict__ pa,
     }
 }
 
-static void macro_kernel(const double*pa,const double*pb,
-                          double*C,int mc,int nc,int kc,int n,int ic,int jc){
+static void macro_kernel_1t(const double*pa,const double*pb,
+                             double*C,int mc,int nc,int kc,int n,int ic,int jc){
     for(int jr=0;jr<nc;jr+=NR){
         int nr=(jr+NR<=nc)?NR:nc-jr;
         const double*pB=pb+(jr/NR)*((size_t)NR*kc);
@@ -376,6 +378,7 @@ static void macro_kernel(const double*pa,const double*pb,
     }
 }
 
+/* Select blocking parameters based on problem size */
 static void get_blocking(int n, int*pMC, int*pKC){
     if(n <= 1024){*pMC=MC_SMALL;*pKC=KC_SMALL;}
     else{*pMC=MC_LARGE;*pKC=KC_LARGE;}
@@ -390,9 +393,9 @@ static void com6_multiply(const double*__restrict__ A,
     nthreads = omp_get_max_threads();
     #endif
 
+    int use_mt = (n > 512 && nthreads > 1);
     int mc_blk, kc_blk;
     get_blocking(n, &mc_blk, &kc_blk);
-    int use_mt = (n > 512 && nthreads > 1);
 
     memset(C, 0, (size_t)n*n*sizeof(double));
 
@@ -403,7 +406,7 @@ static void com6_multiply(const double*__restrict__ A,
                 pack_B(B,pb,kc,nc,n,jc,pc);
                 for(int ic=0;ic<n;ic+=mc_blk){int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
                     pack_A(A,pa,mc,kc,n,ic,pc);
-                    macro_kernel(pa,pb,C,mc,nc,kc,n,ic,jc);
+                    macro_kernel_1t(pa,pb,C,mc,nc,kc,n,ic,jc);
                 }
             }
         }
@@ -441,7 +444,7 @@ static void com6_multiply(const double*__restrict__ A,
                     for(int ic=0;ic<n;ic+=mc_blk){
                         int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
                         pack_A(A,pa,mc,kc,n,ic,pc);
-                        macro_kernel(pa,pb,C,mc,nc,kc,n,ic,jc);
+                        macro_kernel_1t(pa,pb,C,mc,nc,kc,n,ic,jc);
                     }
                 }
             }
@@ -459,6 +462,7 @@ static void com6_multiply_1t(const double*__restrict__ A,
 {
     int mc_blk, kc_blk;
     get_blocking(n, &mc_blk, &kc_blk);
+
     double*pa=aa((size_t)MC_MAX*KC_MAX),*pb=aa((size_t)KC_MAX*NC);
     memset(C,0,(size_t)n*n*sizeof(double));
     for(int jc=0;jc<n;jc+=NC){int nc=(jc+NC<=n)?NC:n-jc;
@@ -466,7 +470,7 @@ static void com6_multiply_1t(const double*__restrict__ A,
             pack_B(B,pb,kc,nc,n,jc,pc);
             for(int ic=0;ic<n;ic+=mc_blk){int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
                 pack_A(A,pa,mc,kc,n,ic,pc);
-                macro_kernel(pa,pb,C,mc,nc,kc,n,ic,jc);
+                macro_kernel_1t(pa,pb,C,mc,nc,kc,n,ic,jc);
     }}}
     af(pa);af(pb);
 }
@@ -489,75 +493,52 @@ int main(void){
     #endif
 
     printf("====================================================================\n");
-    printf("  COM6 v28 - Pure BLIS at Scale (%d threads)\n",nth);
+    printf("  COM6 v28 - Large Sizes + Adaptive Blocking (%d threads)\n",nth);
     printf("  n<=1024: MC=%d KC=%d | n>1024: MC=%d KC=%d\n",MC_SMALL,KC_SMALL,MC_LARGE,KC_LARGE);
-    printf("  8x unrolled ASM, parallel B-pack, adaptive threading\n");
+    printf("  8x unrolled ASM micro-kernel, parallel B-pack\n");
     printf("====================================================================\n\n");
 
-    /* Run MT-only benchmark first (cold CPU = best numbers) */
-    int sizes[]={8192,4096,2048,1024,512,256};
+    int sizes[]={512,1024,2048,4096,8192};
     int ns=sizeof(sizes)/sizeof(sizes[0]);
+    printf("%-10s | %10s | %10s | %8s | %8s | %s\n","Size","1-thread","MT","GF(1T)","GF(MT)","Verify");
+    printf("---------- | ---------- | ---------- | -------- | -------- | ------\n");
 
-    printf("--- MULTI-THREADED (run first, cold CPU) ---\n");
-    printf("%-10s | %10s | %8s | %s\n","Size","Time","GF(MT)","Verify");
-    printf("---------- | ---------- | -------- | ------\n");
-
-    double mt_gf[6]={0};
     for(int si=0;si<ns;si++){
         int n=sizes[si];size_t nn=(size_t)n*n;
-        double*A=aa(nn),*B=aa(nn),*C=aa(nn);
+        double*A=aa(nn),*B=aa(nn),*C1=aa(nn),*C2=aa(nn);
         srand(42);randf(A,n);randf(B,n);
 
-        /* Warmup */
-        com6_multiply(A,B,C,n);
+        int do_1t = (n <= 2048);  /* skip 1T for >=4096 (too slow, thermals) */
+        int runs = (n<=1024)?5:(n<=2048)?3:2;
 
-        int runs=(n<=1024)?5:(n<=2048)?3:(n<=4096)?2:1;
-        double best=1e30;
-        for(int r=0;r<runs;r++){double t0=now();com6_multiply(A,B,C,n);double t=now()-t0;if(t<best)best=t;}
+        double best_1=1e30, gf1=0;
+        if(do_1t){
+            com6_multiply_1t(A,B,C1,n);
+            for(int r=0;r<runs;r++){double t0=now();com6_multiply_1t(A,B,C1,n);double t=now()-t0;if(t<best_1)best_1=t;}
+            gf1=(2.0*n*n*(double)n)/(best_1*1e9);
+        }
 
-        double gf=(2.0*n*n*(double)n)/(best*1e9);
-        mt_gf[si]=gf;
+        com6_multiply(A,B,C2,n);
+        double best_a=1e30;
+        for(int r=0;r<runs;r++){double t0=now();com6_multiply(A,B,C2,n);double t=now()-t0;if(t<best_a)best_a=t;}
+        double gfa=(2.0*n*n*(double)n)/(best_a*1e9);
 
-        /* Quick verify: check a few elements against naive for small, or self-consistency */
-        const char*v="OK";
+        const char*v;
         if(n<=512){double*Cr=aa(nn);naive(A,B,Cr,n);
-            double e=maxerr(C,Cr,n);v=e<1e-6?"OK":"FAIL";af(Cr);}
+            double e=maxerr(C2,Cr,n);if(do_1t){double e1=maxerr(C1,Cr,n);if(e1>e)e=e1;}
+            v=e<1e-6?"OK":"FAIL";af(Cr);
+        }else if(do_1t){v=maxerr(C1,C2,n)<1e-6?"OK":"FAIL";}
+        else{v="--";}
 
-        printf("%4dx%-5d | %8.1f ms | %6.1f   | %s\n",n,n,best*1000,gf,v);
-        af(A);af(B);af(C);
+        if(do_1t)
+            printf("%4dx%-5d | %8.1f ms | %8.1f ms | %6.1f   | %6.1f   | %s\n",
+                   n,n,best_1*1000,best_a*1000,gf1,gfa,v);
+        else
+            printf("%4dx%-5d | %10s | %8.1f ms | %8s | %6.1f   | %s\n",
+                   n,n,"skip",best_a*1000,"--",gfa,v);
+
+        af(A);af(B);af(C1);af(C2);
     }
-
-    /* Now run 1T benchmark (CPU may be warmer but separate section) */
-    printf("\n--- SINGLE-THREADED ---\n");
-    printf("%-10s | %10s | %8s | %s\n","Size","Time","GF(1T)","Verify");
-    printf("---------- | ---------- | -------- | ------\n");
-
-    /* Only test 1T up to 4096 (8192 1T takes ~30s, waste of time + heats CPU) */
-    int sizes_1t[]={256,512,1024,2048,4096};
-    int ns_1t=sizeof(sizes_1t)/sizeof(sizes_1t[0]);
-
-    for(int si=0;si<ns_1t;si++){
-        int n=sizes_1t[si];size_t nn=(size_t)n*n;
-        double*A=aa(nn),*B=aa(nn),*C1=aa(nn);
-        srand(42);randf(A,n);randf(B,n);
-
-        com6_multiply_1t(A,B,C1,n);
-
-        int runs=(n<=1024)?5:(n<=2048)?3:1;
-        double best=1e30;
-        for(int r=0;r<runs;r++){double t0=now();com6_multiply_1t(A,B,C1,n);double t=now()-t0;if(t<best)best=t;}
-
-        double gf=(2.0*n*n*(double)n)/(best*1e9);
-
-        const char*v="OK";
-        if(n<=512){double*Cr=aa(nn);naive(A,B,Cr,n);
-            double e=maxerr(C1,Cr,n);v=e<1e-6?"OK":"FAIL";af(Cr);}
-
-        printf("%4dx%-5d | %8.1f ms | %6.1f   | %s\n",n,n,best*1000,gf,v);
-        af(A);af(B);af(C1);
-    }
-
-    printf("\nTheoretical peak: %.1f GF/core, %.1f GF total (4 cores @ 3.95 GHz)\n",
-           2*4*2*3.95, 4*2*4*2*3.95);
+    printf("\nBest of both worlds: small-size tuning + large-size deep-KC\n");
     return 0;
 }
