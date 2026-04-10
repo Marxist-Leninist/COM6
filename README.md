@@ -25,7 +25,19 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 - **Simplified blocking**: Two tiers instead of four — n<=1024 (MC=120,KC=256) and n>1024 (MC=96,KC=320). Simpler is faster.
 - **Result**: 4096 MT jumped from 75.4 to **118.7 GF** (+57%), 8192 MT from 74.5 to **90.0 GF** (+21%).
 
-### v80 vs OpenBLAS MT (fair interleaved, 10s cooldown between tests)
+### v86 vs OpenBLAS MT (fair interleaved, 10s cooldown between tests)
+
+| Size | OpenBLAS MT | COM6 v86 MT | Ratio | Winner |
+|------|-------------|-------------|-------|--------|
+| 512x512 | 26.3 GF | **77.9 GF** | **2.96x** | **COM6** |
+| 1024x1024 | 74.9 GF | **112.6 GF** | **1.50x** | **COM6** |
+| 2048x2048 | 102.3 GF | **110.0 GF** | **1.08x** | **COM6** |
+| 4096x4096 | 61.1 GF | **71.6 GF** | **1.17x** | **COM6** |
+| 8192x8192 | 58.6 GF | **60.9 GF** | **1.04x** | **COM6** |
+
+**COM6 wins all 5 sizes.** Physical-core-only threading for large sizes keeps sustained clocks higher.
+
+### v80 vs OpenBLAS MT (historical, 10s cooldown between tests)
 
 | Size | OpenBLAS MT | COM6 v80 MT | Ratio | Winner |
 |------|-------------|-------------|-------|--------|
@@ -35,7 +47,7 @@ COM6 is a high-performance matrix multiplication engine built from scratch in C 
 | 4096x4096 | 98.1 GF | **122.9 GF** | **1.25x** | **COM6** |
 | 8192x8192 | 59.1 GF | **69.4 GF** | **1.17x** | **COM6** |
 
-**COM6 wins 4 out of 5 sizes.** 512 loss is OpenMP thread-spawn overhead (BLAS uses persistent threads).
+**COM6 wins 4 out of 5 sizes.** 512 loss was OpenMP thread-spawn overhead.
 
 Note: absolute GFLOPS vary wildly (up to 2x) with thermal state on 15W TDP laptop. Ratios vs OpenBLAS are the meaningful comparison — both are equally affected by thermal throttle.
 
