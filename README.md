@@ -2,7 +2,7 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication at 1024+ sizes.**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 86 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 2x-unrolled B-panel packing, 4x-unrolled A-panel packing with software prefetch, universal persistent-thread-pool (single fork-join for all sizes), physical-core-only threading for large sizes, and branch-free micro-kernels.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 91 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 2x-unrolled B-panel packing, C-prefetch at kernel entry, and branch-free micro-kernels.
 
 ## COM7NN Transformer vs Standard Transformer
 
@@ -17,37 +17,39 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v30 - Latest)
+## COM6 Matrix Multiplication Results (v91 - Latest)
 
-### v30 Benchmarks (8 threads, i7-10510U)
+### v91 Cold-Start Performance (isolated single-size tests, 8 threads, i7-10510U)
 
-| Size | 1-Thread | MT | GF(1T) | GF(MT) |
-|------|----------|-----|--------|--------|
-| 256x256 | 0.8 ms | 0.7 ms | **44.7** | **48.4** |
-| 512x512 | 5.4 ms | 3.5 ms | **49.9** | **76.6** |
-| 1024x1024 | 48.8 ms | 23.1 ms | **44.0** | **93.1** |
-| 2048x2048 | 395.2 ms | 140.4 ms | **43.5** | **122.4** |
-| 4096x4096 | 3210 ms | 1159 ms | **42.8** | **118.6** |
-| 8192x8192 | (skip) | 8940 ms | -- | **123.0** |
+| Size | COM6 1T | COM6 MT | Notes |
+|------|---------|---------|-------|
+| 256x256 | 35.3 GF | 27.1 GF | 1T optimal (threading overhead) |
+| 512x512 | **45.2 GF** | **73.5 GF** | Beta-0 kernel boosts 1T by 6% over v26 |
+| 1024x1024 | **44.8 GF** | **106.7 GF** | MC=48 MT gives 22 balanced ic-strips |
+| 2048x2048 | 37.6 GF | **110.0 GF** | C-prefetch helps beta-1 kernel |
+| 4096x4096 | -- | **80.5 GF** | Thermal-sensitive on 15W laptop |
+| 8192x8192 | -- | **81.5 GF** | Same blocking as 2048/4096 |
 
-**Peak: 123.0 GFLOPS** at 8192 MT (cold CPU). 1T peak: **49.9 GF** at 512 (79% of theoretical peak).
+**Peak: 110.0 GFLOPS** at 2048 MT (cold CPU). 1T peak: **45.2 GF** at 512 (72% of theoretical 63.2 GF).
 
-### v30 Key Changes: L3-Aware NC + 4-Tier Adaptive Blocking
-- **NC=1024 for 8192+**: B panel drops from 5MB to ~3MB, fitting cleanly in 8MB L3. This alone improved 8192 from 90→123 GF.
-- **Four-tier blocking**: KC=256/MC=120 (n<=512), KC=320/MC=96 (n<=2048), KC=320/MC=96 (n<=4096), KC=384/MC=72 (n>=8192).
-- **8192 config sweep**: Tested 8 blocking configs. KC=384/MC=72/NC=1024 won by 30%+ over all alternatives.
-- **Skip 1T for 8192**: Preserves thermal headroom for MT benchmark on 15W TDP laptop.
+### v91 Key Changes: Back to Basics + Beta-0/1 Kernels
+- **v26 architecture restored**: v27-v90 added complexity (Strassen, persistent pools, NT stores, A-reuse) that didn't consistently help. v91 strips back to v26's proven 5-loop BLIS with fork-join per panel.
+- **Beta-0 micro-kernel**: First KC panel writes directly (no C load). Eliminates memset + 12 loads per 6x8 tile. Free 6% 1T improvement.
+- **Beta-1 with C-prefetch**: Subsequent KC panels prefetch all 6 C rows before k-loop. Hides DRAM latency.
+- **MT-specific blocking**: MC=48 for n<=1024 MT (22 ic-strips for 8 threads vs 9 with MC=120). MC=96/KC=320 for larger.
+- **CLI mode**: `./com6_v91 <size> [mt|1t]` for fair cold-CPU benchmarking.
 
-### v30 vs OpenBLAS MT (thermally-compromised sequential run)
+### v91 vs OpenBLAS MT (fair interleaved, 10s cooling between tests)
 
-| Size | OpenBLAS MT | COM6 v30 MT | Ratio | Winner |
+| Size | OpenBLAS MT | COM6 v91 MT | Ratio | Winner |
 |------|-------------|-------------|-------|--------|
-| 1024x1024 | 27.2 GF | **62.1 GF** | **2.28x** | **COM6** |
-| 2048x2048 | 51.1 GF | **60.4 GF** | **1.18x** | **COM6** |
-| 4096x4096 | 64.6 GF | **67.9 GF** | **1.05x** | **COM6** |
-| 8192x8192 | 61.1 GF | **73.3 GF** | **1.20x** | **COM6** |
+| 512x512 | 85.2 GF | **92.3 GF** | **1.08x** | **COM6** |
+| 1024x1024 | 93.0 GF | **108.1 GF** | **1.16x** | **COM6** |
+| 2048x2048 | 90.4 GF | **95.1 GF** | **1.05x** | **COM6** |
+| 4096x4096 | 72.0 GF | **81.7 GF** | **1.13x** | **COM6** |
+| 8192x8192 | 69.7 GF | **79.1 GF** | **1.13x** | **COM6** |
 
-**COM6 wins at all sizes 1024+.** Note: absolute GFLOPS vary wildly with thermal state on 15W TDP laptop. Ratios vs OpenBLAS are the meaningful comparison.
+**COM6 wins all 5 sizes.** Beats OpenBLAS by 5-16%. Note: absolute GFLOPS vary with thermal state on 15W TDP laptop; ratios are the meaningful comparison.
 
 ### v80 vs OpenBLAS MT (historical, 10s cooldown between tests)
 
