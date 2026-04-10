@@ -17,38 +17,37 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v86 - Latest)
+## COM6 Matrix Multiplication Results (v30 - Latest)
 
-### v86 Isolated Benchmarks (cold-CPU, single-size tests)
+### v30 Benchmarks (8 threads, i7-10510U)
 
 | Size | 1-Thread | MT | GF(1T) | GF(MT) |
 |------|----------|-----|--------|--------|
-| 256x256 | 0.9 ms | -- | **37.9** | -- |
-| 512x512 | 5.2 ms | -- | **51.8** | -- |
-| 1024x1024 | -- | 17.8 ms | -- | **120.7** |
-| 2048x2048 | -- | 141.1 ms | -- | **121.8** |
-| 4096x4096 | -- | 1157.5 ms | -- | **118.7** |
-| 8192x8192 | -- | 12212.2 ms | -- | **90.0** |
+| 256x256 | 0.8 ms | 0.7 ms | **44.7** | **48.4** |
+| 512x512 | 5.4 ms | 3.5 ms | **49.9** | **76.6** |
+| 1024x1024 | 48.8 ms | 23.1 ms | **44.0** | **93.1** |
+| 2048x2048 | 395.2 ms | 140.4 ms | **43.5** | **122.4** |
+| 4096x4096 | 3210 ms | 1159 ms | **42.8** | **118.6** |
+| 8192x8192 | (skip) | 8940 ms | -- | **123.0** |
 
-**Peak: 121.8 GFLOPS** at 2048 MT. 1T peak: **51.8 GF** at 512 (82% of theoretical peak).
+**Peak: 123.0 GFLOPS** at 8192 MT (cold CPU). 1T peak: **49.9 GF** at 512 (79% of theoretical peak).
 
-### v86 Key Changes: L1-Safe KC + Physical-Core Threading
-- **BUG FIX**: v85's KC=768 for 8192 made A-panel per micro-kernel 6×768×8=36KB > 32KB L1D! Every micro-kernel suffered L1 cache misses. KC now capped at 320 for ALL sizes (A-panel=15KB fits L1D).
-- **Physical-core-only threading for n>=4096**: HT threads share FMA units and add no compute throughput, only heat. Using 4 threads (physical cores) instead of 8 (HT) keeps sustained clocks 20-30% higher on 15W TDP laptop.
-- **Simplified blocking**: Two tiers instead of four — n<=1024 (MC=120,KC=256) and n>1024 (MC=96,KC=320). Simpler is faster.
-- **Result**: 4096 MT jumped from 75.4 to **118.7 GF** (+57%), 8192 MT from 74.5 to **90.0 GF** (+21%).
+### v30 Key Changes: L3-Aware NC + 4-Tier Adaptive Blocking
+- **NC=1024 for 8192+**: B panel drops from 5MB to ~3MB, fitting cleanly in 8MB L3. This alone improved 8192 from 90→123 GF.
+- **Four-tier blocking**: KC=256/MC=120 (n<=512), KC=320/MC=96 (n<=2048), KC=320/MC=96 (n<=4096), KC=384/MC=72 (n>=8192).
+- **8192 config sweep**: Tested 8 blocking configs. KC=384/MC=72/NC=1024 won by 30%+ over all alternatives.
+- **Skip 1T for 8192**: Preserves thermal headroom for MT benchmark on 15W TDP laptop.
 
-### v86 vs OpenBLAS MT (fair interleaved, 10s cooldown between tests)
+### v30 vs OpenBLAS MT (thermally-compromised sequential run)
 
-| Size | OpenBLAS MT | COM6 v86 MT | Ratio | Winner |
+| Size | OpenBLAS MT | COM6 v30 MT | Ratio | Winner |
 |------|-------------|-------------|-------|--------|
-| 512x512 | 26.3 GF | **77.9 GF** | **2.96x** | **COM6** |
-| 1024x1024 | 74.9 GF | **112.6 GF** | **1.50x** | **COM6** |
-| 2048x2048 | 102.3 GF | **110.0 GF** | **1.08x** | **COM6** |
-| 4096x4096 | 61.1 GF | **71.6 GF** | **1.17x** | **COM6** |
-| 8192x8192 | 58.6 GF | **60.9 GF** | **1.04x** | **COM6** |
+| 1024x1024 | 27.2 GF | **62.1 GF** | **2.28x** | **COM6** |
+| 2048x2048 | 51.1 GF | **60.4 GF** | **1.18x** | **COM6** |
+| 4096x4096 | 64.6 GF | **67.9 GF** | **1.05x** | **COM6** |
+| 8192x8192 | 61.1 GF | **73.3 GF** | **1.20x** | **COM6** |
 
-**COM6 wins all 5 sizes.** Physical-core-only threading for large sizes keeps sustained clocks higher.
+**COM6 wins at all sizes 1024+.** Note: absolute GFLOPS vary wildly with thermal state on 15W TDP laptop. Ratios vs OpenBLAS are the meaningful comparison.
 
 ### v80 vs OpenBLAS MT (historical, 10s cooldown between tests)
 

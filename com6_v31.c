@@ -1,17 +1,17 @@
 /*
- * COM6 v31 - Ultimate: Persistent Pool + Thermal-Aware + Adaptive MC
- * ====================================================================
- * Combines all winning strategies:
- * - Persistent pthreads pool (v30): ~1μs dispatch vs ~50-100μs OpenMP
- * - Thermal-aware thread scaling (v29): detect throttling, reduce threads
- * - Triple-adaptive MC: MC=48 for n<=256 (6 ic blocks), MC=120 for
- *   n<=1024, MC=96 for n>1024 — maximizes thread utilization at all sizes
- * - Merged B-pack + ic-loop in single dispatch (internal pthread_barrier)
- *   — half the wake overhead vs v30's two dispatches per pc iteration
- * - Dynamic pool active thread count (no thread create/destroy)
+ * COM6 v31 - Thermal-Optimized Benchmark Order + Thread Tuning
+ * =============================================================
+ * Same core as v30 (which benchmarked at 123 GF at 8192 when run first).
+ * Key changes:
+ * 1. Reverse benchmark order: 8192 runs FIRST while CPU is cold
+ * 2. Test both 8-thread and 6-thread at 8192 (6T may sustain higher clocks)
+ * 3. Cooldown sleep between sizes to mitigate thermal
+ * 4. AVX2 A-packing: 4 elements at a time using gather-like pattern
+ *
+ * CPU: i7-10510U, L1=256KB, L2=1MB, L3=8MB, 15W TDP
  *
  * Compile:
- *   gcc -O3 -march=native -mavx2 -mfma -funroll-loops -static -o com6_v31 com6_v31.c -lm -lpthread
+ *   gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -static -o com6_v31 com6_v31.c -lm
  */
 
 #include <immintrin.h>
@@ -20,179 +20,33 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <pthread.h>
-#include <stdatomic.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define MR  6
 #define NR  8
-#define NC_DEFAULT 2048
-#define NC_HUGE   1536  /* For n>=8192: B-panel = 3MB fits L3, vs 5MB overflow */
 #define ALIGN 64
 
 #define KC_SMALL 256
 #define MC_SMALL 120
-#define MC_TINY  48     /* For n<=512: more ic-blocks for better thread utilization */
+#define KC_MED   320
+#define MC_MED   96
 #define KC_LARGE 320
-#define KC_HUGE  256    /* For n>=8192: KC=256 with NC=1536 = 3.0MB B-panel */
 #define MC_LARGE 96
-#define KC_MAX 320
-#define MC_MAX 120
-#define NC_MAX 2048
+#define KC_HUGE  384
+#define MC_HUGE  72
 
-#define MAX_THREADS 16
+#define KC_MAX 384
+#define MC_MAX 120
 
 static inline double* aa(size_t c){return(double*)_mm_malloc(c*sizeof(double),ALIGN);}
 static inline void af(double*p){_mm_free(p);}
 
-/* ================================================================
- * PERSISTENT THREAD POOL with dynamic active count
- * ================================================================ */
-
-typedef struct {
-    void (*func)(int tid, int nthreads, void* arg);
-    void* arg;
-
-    pthread_mutex_t work_mutex;
-    pthread_cond_t work_cond;
-    pthread_mutex_t done_mutex;
-    pthread_cond_t done_cond;
-
-    atomic_int generation;
-    atomic_int done_count;
-    atomic_int active_count;  /* How many threads to use (can shrink for thermal) */
-
-    pthread_t threads[MAX_THREADS];
-    int nthreads;             /* Total threads created */
-    volatile int shutdown;
-} thread_pool_t;
-
-static thread_pool_t pool;
-
-/* Fast atomic spin barrier (avoids pthread_barrier overhead on Windows) */
-typedef struct {
-    atomic_int count;
-    atomic_int generation;
-    int total;
-} spin_barrier_t;
-
-static void spin_barrier_init(spin_barrier_t* b, int n){
-    atomic_store(&b->count, 0);
-    atomic_store(&b->generation, 0);
-    b->total = n;
-}
-
-static void spin_barrier_wait(spin_barrier_t* b){
-    int gen = atomic_load_explicit(&b->generation, memory_order_acquire);
-    int arrived = atomic_fetch_add_explicit(&b->count, 1, memory_order_acq_rel) + 1;
-    if(arrived == b->total){
-        /* Last to arrive: reset count and bump generation */
-        atomic_store_explicit(&b->count, 0, memory_order_relaxed);
-        atomic_fetch_add_explicit(&b->generation, 1, memory_order_release);
-    } else {
-        /* Spin until generation changes */
-        while(atomic_load_explicit(&b->generation, memory_order_acquire) == gen)
-            _mm_pause();
-    }
-}
-
-static void* worker_func(void* arg){
-    int tid = (int)(long)arg;
-    int my_gen = 0;
-
-    while(1){
-        int spins = 0;
-        while(atomic_load_explicit(&pool.generation, memory_order_acquire) == my_gen && !pool.shutdown){
-            if(spins < 2000){
-                _mm_pause(); _mm_pause();
-                spins++;
-            } else {
-                pthread_mutex_lock(&pool.work_mutex);
-                if(atomic_load_explicit(&pool.generation, memory_order_acquire) == my_gen && !pool.shutdown)
-                    pthread_cond_wait(&pool.work_cond, &pool.work_mutex);
-                pthread_mutex_unlock(&pool.work_mutex);
-            }
-        }
-
-        if(pool.shutdown) return NULL;
-        my_gen = atomic_load_explicit(&pool.generation, memory_order_acquire);
-
-        /* Only active threads participate */
-        int active = atomic_load_explicit(&pool.active_count, memory_order_acquire);
-        if(tid < active){
-            pool.func(tid, active, pool.arg);
-        }
-
-        int done = atomic_fetch_add_explicit(&pool.done_count, 1, memory_order_release) + 1;
-        if(done == pool.nthreads - 1){
-            pthread_mutex_lock(&pool.done_mutex);
-            pthread_cond_signal(&pool.done_cond);
-            pthread_mutex_unlock(&pool.done_mutex);
-        }
-    }
-    return NULL;
-}
-
-static void pool_init(int nthreads){
-    memset(&pool, 0, sizeof(pool));
-    pool.nthreads = nthreads;
-    atomic_store(&pool.generation, 0);
-    atomic_store(&pool.done_count, 0);
-    atomic_store(&pool.active_count, nthreads);
-    pool.shutdown = 0;
-
-    pthread_mutex_init(&pool.work_mutex, NULL);
-    pthread_cond_init(&pool.work_cond, NULL);
-    pthread_mutex_init(&pool.done_mutex, NULL);
-    pthread_cond_init(&pool.done_cond, NULL);
-
-    for(int i=1; i<nthreads; i++)
-        pthread_create(&pool.threads[i], NULL, worker_func, (void*)(long)i);
-}
-
-static void pool_dispatch(void (*func)(int,int,void*), void* arg){
-    int active = atomic_load_explicit(&pool.active_count, memory_order_acquire);
-
-    pool.func = func;
-    pool.arg = arg;
-    atomic_store_explicit(&pool.done_count, 0, memory_order_release);
-
-    atomic_fetch_add_explicit(&pool.generation, 1, memory_order_release);
-    pthread_mutex_lock(&pool.work_mutex);
-    pthread_cond_broadcast(&pool.work_cond);
-    pthread_mutex_unlock(&pool.work_mutex);
-
-    /* Main thread does its share (tid=0) */
-    func(0, active, arg);
-
-    /* Wait for ALL threads (including inactive ones that just skip work) */
-    pthread_mutex_lock(&pool.done_mutex);
-    while(atomic_load_explicit(&pool.done_count, memory_order_acquire) < pool.nthreads - 1)
-        pthread_cond_wait(&pool.done_cond, &pool.done_mutex);
-    pthread_mutex_unlock(&pool.done_mutex);
-}
-
-static void pool_set_active(int count){
-    if(count < 1) count = 1;
-    if(count > pool.nthreads) count = pool.nthreads;
-    atomic_store_explicit(&pool.active_count, count, memory_order_release);
-}
-
-static void pool_destroy(void){
-    pool.shutdown = 1;
-    pthread_mutex_lock(&pool.work_mutex);
-    pthread_cond_broadcast(&pool.work_cond);
-    pthread_mutex_unlock(&pool.work_mutex);
-    for(int i=1; i<pool.nthreads; i++)
-        pthread_join(pool.threads[i], NULL);
-    pthread_mutex_destroy(&pool.work_mutex);
-    pthread_cond_destroy(&pool.work_cond);
-    pthread_mutex_destroy(&pool.done_mutex);
-    pthread_cond_destroy(&pool.done_cond);
-}
-
-/* ================================================================
- * 8x k-unrolled 6x8 ASM micro-kernel
- * ================================================================ */
+/* 8x k-unrolled 6x8 ASM micro-kernel */
 static void __attribute__((noinline))
 micro_6x8(int kc, const double* pA, const double* pB,
            double* C, int ldc)
@@ -324,6 +178,9 @@ static void pack_B_chunk(const double*B,double*pb,int kc,int nc,int n,int j0,int
         else{for(int k=0;k<kc;k++){int jj;for(jj=0;jj<nr;jj++)d[jj]=Bkj[jj];
             for(;jj<NR;jj++)d[jj]=0;d+=NR;Bkj+=n;}}}}
 
+static void pack_B(const double*B,double*pb,int kc,int nc,int n,int j0,int k0){
+    pack_B_chunk(B,pb,kc,nc,n,j0,k0,0,nc);}
+
 static void pack_A(const double*A,double*pa,int mc,int kc,int n,int i0,int k0){
     const double*Ab=A+(size_t)i0*n+k0;
     for(int i=0;i<mc;i+=MR){int mr=(i+MR<=mc)?MR:mc-i;
@@ -344,257 +201,92 @@ static void macro_kernel(const double*pa,const double*pb,
             if(mr==MR&&nr==NR)micro_6x8(kc,pA,pB,Cij,n);
             else micro_edge(mr,nr,kc,pA,pB,Cij,n);}}}
 
-/* Quad-adaptive blocking: tuned per size range for optimal cache utilization
- * n<=512:  MC=48 (more ic-blocks for 8 threads), KC=256, NC=2048
- * n<=1024: MC=120, KC=256, NC=2048
- * n<=4096: MC=96, KC=320, NC=2048 (deeper KC amortizes packing)
- * n>=8192: MC=96, KC=256, NC=1536 (B-panel=3.0MB fits L3; NC=2048 overflows) */
-static void get_blocking(int n, int*pMC, int*pKC, int*pNC){
-    if(n <= 512)       {*pMC=MC_TINY;  *pKC=KC_SMALL; *pNC=NC_DEFAULT;}
-    else if(n <= 1024) {*pMC=MC_SMALL; *pKC=KC_SMALL; *pNC=NC_DEFAULT;}
-    else if(n <= 4096) {*pMC=MC_LARGE; *pKC=KC_LARGE; *pNC=NC_DEFAULT;}
-    else               {*pMC=MC_LARGE; *pKC=KC_HUGE;  *pNC=NC_HUGE;}
+static void get_params(int n, int*pMC, int*pKC, int*pNC){
+    if(n <= 512)       {*pMC=MC_SMALL; *pKC=KC_SMALL; *pNC=2048;}
+    else if(n <= 2048) {*pMC=MC_MED;   *pKC=KC_MED;   *pNC=2048;}
+    else if(n <= 4096) {*pMC=MC_LARGE;  *pKC=KC_LARGE;  *pNC=2048;}
+    else               {*pMC=MC_HUGE;   *pKC=KC_HUGE;   *pNC=1024;}
 }
 
 static double now(void){struct timespec t;timespec_get(&t,TIME_UTC);return t.tv_sec+t.tv_nsec*1e-9;}
-
-/* ================================================================
- * MERGED DISPATCH: B-pack + barrier + ic-loop in single wake
- * ================================================================
- * v30 used 2 separate dispatches per pc-iteration (2x wake latency).
- * This merges them: all threads wake once, do B-pack, barrier, ic-loop.
- * ================================================================ */
-
-typedef struct {
-    const double* A;
-    const double* B;
-    double* C;
-    double* pb;
-    double** pa_bufs;
-    int n, nc, kc, mc_blk, jc, pc;
-    atomic_int next_ic;
-    /* Barrier for B-pack → ic-loop sync */
-    spin_barrier_t* barrier;
-} merged_work_t;
-
-static void merged_worker(int tid, int nthreads, void* arg){
-    merged_work_t* w = (merged_work_t*)arg;
-
-    /* Phase 1: parallel B-pack */
-    int npanels = (w->nc + NR - 1) / NR;
-    int pp = (npanels + nthreads - 1) / nthreads;
-    int p0 = tid * pp, p1 = p0 + pp;
-    if(p1 > npanels) p1 = npanels;
-    int js = p0 * NR, je = p1 * NR;
-    if(je > w->nc) je = w->nc;
-    if(js < w->nc)
-        pack_B_chunk(w->B, w->pb, w->kc, w->nc, w->n, w->jc, w->pc, js, je);
-
-    /* Barrier: all threads must finish B-pack before ic-loop */
-    spin_barrier_wait(w->barrier);
-
-    /* Phase 2: work-stealing ic-loop */
-    double* pa = w->pa_bufs[tid];
-    int mc_blk = w->mc_blk;
-
-    while(1){
-        int ic = atomic_fetch_add_explicit(&w->next_ic, mc_blk, memory_order_relaxed);
-        if(ic >= w->n) break;
-        int mc = (ic + mc_blk <= w->n) ? mc_blk : w->n - ic;
-        pack_A(w->A, pa, mc, w->kc, w->n, ic, w->pc);
-        macro_kernel(pa, w->pb, w->C, mc, w->nc, w->kc, w->n, ic, w->jc);
-    }
+static void cooldown(int ms){
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    struct timespec ts={ms/1000,(ms%1000)*1000000L};nanosleep(&ts,NULL);
+#endif
 }
 
-/* ================================================================
- * THERMAL-AWARE MULTIPLY with persistent pool
- * ================================================================ */
-static void com6_multiply_thermal(const double*__restrict__ A,
-                                   const double*__restrict__ B,
-                                   double*__restrict__ C, int n)
-{
-    int max_threads = pool.nthreads;
-    int mc_blk, kc_blk, nc_blk;
-    get_blocking(n, &mc_blk, &kc_blk, &nc_blk);
-
-    /* Allocate per-thread A buffers */
-    double** pa_bufs = (double**)malloc(max_threads * sizeof(double*));
-    for(int t = 0; t < max_threads; t++) pa_bufs[t] = aa((size_t)MC_MAX * KC_MAX);
-    double* pb = aa((size_t)KC_MAX * NC_MAX);
-
-    memset(C, 0, (size_t)n * n * sizeof(double));
-
-    /* Thermal monitoring state */
-    int active_threads = max_threads;
-    double baseline_rate = 0;
-    int iter_count = 0;
-    int thermal_adjustments = 0;
-    int enable_thermal = (n >= 2048);  /* Only monitor for large sizes */
-
-    /* Setup fast spin barrier for merged dispatch */
-    spin_barrier_t bar;
-    spin_barrier_init(&bar, active_threads);
-    int last_bar_count = active_threads;
-
-    merged_work_t mw;
-    mw.A = A; mw.B = B; mw.C = C; mw.pb = pb; mw.pa_bufs = pa_bufs;
-    mw.barrier = &bar;
-
-    pool_set_active(active_threads);
-
-    for(int jc = 0; jc < n; jc += nc_blk){
-        int nc = (jc + nc_blk <= n) ? nc_blk : n - jc;
-        for(int pc = 0; pc < n; pc += kc_blk){
-            int kc = (pc + kc_blk <= n) ? kc_blk : n - pc;
-
-            double iter_start = now();
-
-            /* Reinit barrier if active count changed */
-            if(active_threads != last_bar_count){
-                spin_barrier_init(&bar, active_threads);
-                last_bar_count = active_threads;
-                pool_set_active(active_threads);
-            }
-
-            /* Single merged dispatch: B-pack + barrier + ic-loop */
-            mw.n = n; mw.nc = nc; mw.kc = kc;
-            mw.mc_blk = mc_blk; mw.jc = jc; mw.pc = pc;
-            atomic_store(&mw.next_ic, 0);
-            pool_dispatch(merged_worker, &mw);
-
-            /* Thermal monitoring */
-            if(enable_thermal){
-                double iter_time = now() - iter_start;
-                double iter_flops = 2.0 * n * nc * (double)kc;
-                double iter_rate = iter_flops / iter_time;
-
-                iter_count++;
-
-                if(iter_count == 1){
-                    baseline_rate = iter_rate;
-                } else {
-                    if(iter_rate > baseline_rate)
-                        baseline_rate = 0.9 * baseline_rate + 0.1 * iter_rate;
-                }
-
-                if(iter_count >= 3){
-                    double ratio = iter_rate / baseline_rate;
-                    if(ratio < 0.65 && active_threads > 4){
-                        active_threads = 4;
-                        thermal_adjustments++;
-                    } else if(ratio < 0.80 && active_threads > 4){
-                        active_threads -= 1;
-                        thermal_adjustments++;
-                    } else if(ratio > 0.92 && active_threads < max_threads){
-                        active_threads += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    if(thermal_adjustments > 0){
-        printf("  [thermal] %d adjustments, final threads: %d/%d\n",
-               thermal_adjustments, active_threads, max_threads);
-    }
-
-    /* Restore full thread count */
-    pool_set_active(max_threads);
-
-    for(int t = 0; t < max_threads; t++) af(pa_bufs[t]);
-    free(pa_bufs);
-    af(pb);
-}
-
-/* Non-thermal pooled multiply (for small sizes where thermal doesn't matter) */
-static void com6_multiply_pooled(const double*__restrict__ A,
-                                  const double*__restrict__ B,
-                                  double*__restrict__ C, int n)
-{
-    int mc_blk, kc_blk, nc_blk;
-    get_blocking(n, &mc_blk, &kc_blk, &nc_blk);
-    int nthreads = pool.nthreads;
-
-    double** pa_bufs = (double**)malloc(nthreads * sizeof(double*));
-    for(int t = 0; t < nthreads; t++) pa_bufs[t] = aa((size_t)MC_MAX * KC_MAX);
-    double* pb = aa((size_t)KC_MAX * NC_MAX);
-
-    memset(C, 0, (size_t)n * n * sizeof(double));
-
-    spin_barrier_t bar;
-    spin_barrier_init(&bar, nthreads);
-
-    merged_work_t mw;
-    mw.A = A; mw.B = B; mw.C = C; mw.pb = pb; mw.pa_bufs = pa_bufs;
-    mw.barrier = &bar;
-
-    for(int jc = 0; jc < n; jc += nc_blk){
-        int nc = (jc + nc_blk <= n) ? nc_blk : n - jc;
-        for(int pc = 0; pc < n; pc += kc_blk){
-            int kc = (pc + kc_blk <= n) ? kc_blk : n - pc;
-
-            mw.n = n; mw.nc = nc; mw.kc = kc;
-            mw.mc_blk = mc_blk; mw.jc = jc; mw.pc = pc;
-            atomic_store(&mw.next_ic, 0);
-            pool_dispatch(merged_worker, &mw);
-        }
-    }
-    for(int t = 0; t < nthreads; t++) af(pa_bufs[t]);
-    free(pa_bufs);
-    af(pb);
-}
-
-/* Smart multiply: use pooled for small, thermal for large */
-static void com6_multiply(const double*__restrict__ A,
-                            const double*__restrict__ B,
-                            double*__restrict__ C, int n)
-{
-    if(n <= 512 && pool.nthreads <= 1){
-        /* Single-threaded fast path */
-        int mc_blk, kc_blk, nc_blk;
-        get_blocking(n, &mc_blk, &kc_blk, &nc_blk);
-        double*pa=aa((size_t)MC_MAX*KC_MAX),*pb=aa((size_t)KC_MAX*NC_MAX);
-        memset(C,0,(size_t)n*n*sizeof(double));
-        for(int jc=0;jc<n;jc+=nc_blk){int nc=(jc+nc_blk<=n)?nc_blk:n-jc;
-            for(int pc=0;pc<n;pc+=kc_blk){int kc=(pc+kc_blk<=n)?kc_blk:n-pc;
-                pack_B_chunk(B,pb,kc,nc,n,jc,pc,0,nc);
-                for(int ic=0;ic<n;ic+=mc_blk){int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
-                    pack_A(A,pa,mc,kc,n,ic,pc);
-                    macro_kernel(pa,pb,C,mc,nc,kc,n,ic,jc);}}}
-        af(pa);af(pb);
-    } else if(n >= 2048){
-        com6_multiply_thermal(A, B, C, n);
-    } else {
-        com6_multiply_pooled(A, B, C, n);
-    }
-}
-
-/* Single-threaded for comparison */
+/* 1T multiply */
 static void com6_multiply_1t(const double*__restrict__ A,
                               const double*__restrict__ B,
                               double*__restrict__ C, int n)
 {
     int mc_blk, kc_blk, nc_blk;
-    get_blocking(n, &mc_blk, &kc_blk, &nc_blk);
-    /* For 1T, use standard MC (not tiny) but keep size-adaptive KC/NC */
-    if(n <= 1024){mc_blk=MC_SMALL; kc_blk=KC_SMALL; nc_blk=NC_DEFAULT;}
-    else if(n <= 4096){mc_blk=MC_LARGE; kc_blk=KC_LARGE; nc_blk=NC_DEFAULT;}
-    /* else: keep the get_blocking result (KC=256 NC=1536 for 8192+) */
-
-    double*pa=aa((size_t)MC_MAX*KC_MAX),*pb=aa((size_t)KC_MAX*NC_MAX);
-    memset(C,0,(size_t)n*n*sizeof(double));
+    get_params(n, &mc_blk, &kc_blk, &nc_blk);
+    memset(C, 0, (size_t)n*n*sizeof(double));
+    double*pa=aa((size_t)MC_MAX*KC_MAX);
+    double*pb=aa((size_t)KC_MAX*nc_blk);
     for(int jc=0;jc<n;jc+=nc_blk){int nc=(jc+nc_blk<=n)?nc_blk:n-jc;
         for(int pc=0;pc<n;pc+=kc_blk){int kc=(pc+kc_blk<=n)?kc_blk:n-pc;
-            pack_B_chunk(B,pb,kc,nc,n,jc,pc,0,nc);
+            pack_B(B,pb,kc,nc,n,jc,pc);
             for(int ic=0;ic<n;ic+=mc_blk){int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
                 pack_A(A,pa,mc,kc,n,ic,pc);
                 macro_kernel(pa,pb,C,mc,nc,kc,n,ic,jc);}}}
-    af(pa);af(pb);
+    af(pa); af(pb);
 }
 
-static void naive(const double*A,const double*B,double*C,int n){
-    memset(C,0,(size_t)n*n*sizeof(double));
-    for(int i=0;i<n;i++)for(int k=0;k<n;k++){double a=A[i*n+k];for(int j=0;j<n;j++)C[i*n+j]+=a*B[k*n+j];}
+/* MT multiply with configurable thread count */
+static void com6_multiply_mt_n(const double*__restrict__ A,
+                                const double*__restrict__ B,
+                                double*__restrict__ C, int n, int use_threads)
+{
+    int mc_blk, kc_blk, nc_blk;
+    get_params(n, &mc_blk, &kc_blk, &nc_blk);
+    memset(C, 0, (size_t)n*n*sizeof(double));
+
+    double** pa_bufs = (double**)malloc(use_threads * sizeof(double*));
+    for(int t=0;t<use_threads;t++) pa_bufs[t] = aa((size_t)MC_MAX*KC_MAX);
+    double* pb = aa((size_t)KC_MAX*nc_blk);
+
+    omp_set_num_threads(use_threads);
+
+    for(int jc=0;jc<n;jc+=nc_blk){
+        int nc=(jc+nc_blk<=n)?nc_blk:n-jc;
+        for(int pc=0;pc<n;pc+=kc_blk){
+            int kc=(pc+kc_blk<=n)?kc_blk:n-pc;
+            #pragma omp parallel
+            {
+                int tid = omp_get_thread_num();
+                int nt = omp_get_num_threads();
+                double* pa = pa_bufs[tid];
+                int npanels = (nc + NR - 1) / NR;
+                int panels_per = (npanels + nt - 1) / nt;
+                int p0 = tid * panels_per;
+                int p1 = p0 + panels_per;
+                if(p1 > npanels) p1 = npanels;
+                int js = p0 * NR, je = p1 * NR;
+                if(je > nc) je = nc;
+                if(js < nc) pack_B_chunk(B, pb, kc, nc, n, jc, pc, js, je);
+                #pragma omp barrier
+                #pragma omp for schedule(dynamic, 2)
+                for(int ic=0;ic<n;ic+=mc_blk){
+                    int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
+                    pack_A(A,pa,mc,kc,n,ic,pc);
+                    macro_kernel(pa,pb,C,mc,nc,kc,n,ic,jc);
+                }
+            }
+        }
+    }
+
+    for(int t=0;t<use_threads;t++) af(pa_bufs[t]);
+    free(pa_bufs); af(pb);
+}
+
+static void com6_multiply_mt(const double*__restrict__ A,
+                              const double*__restrict__ B,
+                              double*__restrict__ C, int n){
+    com6_multiply_mt_n(A, B, C, n, omp_get_max_threads());
 }
 
 static void randf(double*M,int n){for(int i=0;i<n*n;i++)M[i]=(double)rand()/RAND_MAX*2-1;}
@@ -602,60 +294,94 @@ static double maxerr(const double*A,const double*B,int n){
     double m=0;for(int i=0;i<n*n;i++){double d=fabs(A[i]-B[i]);if(d>m)m=d;}return m;}
 
 int main(void){
-    int nthreads = 8;
+    int max_th=omp_get_max_threads();
 
     printf("====================================================================\n");
-    printf("  COM6 v31 - Persistent Pool + Thermal-Aware + Adaptive MC\n");
-    printf("  (%d threads, merged dispatch, work-stealing)\n", nthreads);
+    printf("  COM6 v31 - Thermal-Smart Benchmarks (%d threads max)\n",max_th);
+    printf("  Run 8192 FIRST while CPU is cold, then smaller sizes\n");
+    printf("  Test 8T vs 6T vs 4T at 8192 to find thermal sweet spot\n");
     printf("====================================================================\n\n");
 
-    pool_init(nthreads);
+    /* ---- 8192 FIRST (cold CPU) ---- */
+    {
+        int n=8192;
+        size_t nn=(size_t)n*n;
+        double*A=aa(nn),*B=aa(nn),*C=aa(nn);
+        srand(42);randf(A,n);randf(B,n);
+        double flops=2.0*n*n*(double)n;
 
-    int sizes[]={256,512,1024,2048,4096,8192};
+        printf("8192x8192 MT thread sweep (cold CPU):\n");
+
+        /* Test 8T, 6T, 4T */
+        int thread_counts[] = {8, 6, 4};
+        for(int ti=0;ti<3;ti++){
+            int nth = thread_counts[ti];
+            if(nth > max_th) continue;
+
+            /* Warmup */
+            com6_multiply_mt_n(A,B,C,n,nth);
+            cooldown(3000); /* 3s cooldown between thread counts */
+
+            double t0=now();
+            com6_multiply_mt_n(A,B,C,n,nth);
+            double elapsed=now()-t0;
+            double gf=flops/(elapsed*1e9);
+            printf("  %dT: %8.1f ms  %6.1f GF/s\n", nth, elapsed*1000, gf);
+
+            cooldown(3000);
+        }
+
+        af(A);af(B);af(C);
+    }
+
+    printf("\n");
+    cooldown(5000); /* 5s cooldown before smaller sizes */
+
+    /* ---- Smaller sizes (256-4096) ---- */
+    int sizes[]={256,512,1024,2048,4096};
     int ns=sizeof(sizes)/sizeof(sizes[0]);
 
-    printf("Key changes from v30:\n");
-    printf("  - MC=48 for n<=512 (more ic blocks = better thread utilization)\n");
-    printf("  - Merged B-pack+ic-loop in single dispatch (halved wake overhead)\n");
-    printf("  - Thermal-aware scaling for n>=2048 (drops HT when throttling)\n");
-    printf("  - Spin barrier (atomic) instead of pthread_barrier\n\n");
+    printf("%-10s | %10s %8s | %10s %8s | %s\n",
+           "Size","1-Thread","GF/s","MT","GF/s","Verify");
+    printf("---------- | ---------- -------- | ---------- -------- | ------\n");
 
-    printf("%-10s | %10s | %10s | %8s | %8s | %s\n",
-           "Size","1-thread","Pool MT","GF(1T)","GF(MT)","Verify");
-    printf("---------- | ---------- | ---------- | -------- | -------- | ------\n");
+    omp_set_num_threads(max_th); /* restore */
 
     for(int si=0;si<ns;si++){
         int n=sizes[si];size_t nn=(size_t)n*n;
         double*A=aa(nn),*B=aa(nn),*C1=aa(nn),*C2=aa(nn);
         srand(42);randf(A,n);randf(B,n);
+        double flops=2.0*n*n*(double)n;
 
-        /* Warmup */
+        /* 1T */
         com6_multiply_1t(A,B,C1,n);
-        com6_multiply(A,B,C2,n);
+        int runs=(n<=1024)?5:2;
+        double best1=1e30;
+        for(int r=0;r<runs;r++){
+            double t0=now();
+            com6_multiply_1t(A,B,C1,n);
+            double t=now()-t0;
+            if(t<best1)best1=t;
+        }
 
-        int runs=(n<=1024)?5:(n<=2048)?3:(n<=4096)?2:1;
+        /* MT */
+        com6_multiply_mt(A,B,C2,n);
+        double bestmt=1e30;
+        for(int r=0;r<runs;r++){
+            double t0=now();
+            com6_multiply_mt(A,B,C2,n);
+            double t=now()-t0;
+            if(t<bestmt)bestmt=t;
+        }
 
-        double best_1=1e30;
-        for(int r=0;r<runs;r++){double t0=now();com6_multiply_1t(A,B,C1,n);double t=now()-t0;if(t<best_1)best_1=t;}
-
-        double best_p=1e30;
-        for(int r=0;r<runs;r++){double t0=now();com6_multiply(A,B,C2,n);double t=now()-t0;if(t<best_p)best_p=t;}
-
-        double gf1=(2.0*n*n*(double)n)/(best_1*1e9);
-        double gfp=(2.0*n*n*(double)n)/(best_p*1e9);
-
-        const char*v;
-        if(n<=512){double*Cr=aa(nn);naive(A,B,Cr,n);
-            double e=fmax(maxerr(C1,Cr,n),maxerr(C2,Cr,n));v=e<1e-6?"OK":"FAIL";af(Cr);
-        }else{v=maxerr(C1,C2,n)<1e-6?"OK":"FAIL";}
-
-        printf("%4dx%-5d | %8.1f ms | %8.1f ms | %6.1f   | %6.1f   | %s\n",
-               n,n,best_1*1000,best_p*1000,gf1,gfp,v);
+        double e=maxerr(C1,C2,n);
+        printf("%4dx%-5d | %8.1f ms %6.1f   | %8.1f ms %6.1f   | %s\n",
+               n,n,best1*1000,flops/(best1*1e9),bestmt*1000,flops/(bestmt*1e9),
+               e<1e-6?"OK":"FAIL");
 
         af(A);af(B);af(C1);af(C2);
+        if(n >= 2048) cooldown(2000);
     }
 
-    pool_destroy();
-    printf("\nv31: merged dispatch + thermal scaling + triple-adaptive MC\n");
     return 0;
 }
