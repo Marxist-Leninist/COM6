@@ -4,7 +4,20 @@
 
 COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 86 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 2x-unrolled B-panel packing, 4x-unrolled A-panel packing with software prefetch, universal persistent-thread-pool (single fork-join for all sizes), physical-core-only threading for large sizes, and branch-free micro-kernels.
 
-## Results (v86 - Latest)
+## COM7NN Transformer vs Standard Transformer
+
+The COM framework extends beyond matrix multiplication into neural network architectures. COM7NN implements a full transformer with the COM Tensor class (shape-safety, custom operations).
+
+| Metric | Standard NumPy | COM7NN | Winner |
+|--------|---------------|--------|--------|
+| Final loss | 2.808 | **2.290** | COM7NN |
+| Loss reduction | 34.4% | **49.7%** | COM7NN |
+| Training time | 36.93s | **19.95s** | COM7NN (1.85x faster) |
+| Inference accuracy | 4/10 | **6/10** | COM7NN |
+
+Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
+
+## COM6 Matrix Multiplication Results (v86 - Latest)
 
 ### v86 Isolated Benchmarks (cold-CPU, single-size tests)
 
