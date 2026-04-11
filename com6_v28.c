@@ -1,15 +1,18 @@
 /*
- * COM6 v26 - Adaptive Cache Blocking + 8x Unrolled ASM
- * =====================================================
- * Merges v24 and v25: uses different KC/MC for different matrix sizes.
- * - n<=1024: KC=256, MC=120 (v24 tuning, best for small)
- * - n>1024:  KC=320, MC=96  (v25 tuning, best for large — 115 GFLOPS)
+ * COM6 v28 - Pure BLIS for All Sizes + 8192 Support
+ * ==================================================
+ * Drops Strassen (v27 proved it hurts with this micro-kernel).
+ * Three-tier adaptive blocking:
+ *   n<=1024:  KC=256, MC=120 (v24 sweet spot)
+ *   n<=4096:  KC=320, MC=96  (v25 sweet spot)
+ *   n>=8192:  KC=384, MC=80  (deeper KC amortizes packing for huge matrices)
+ * All fit L2: 120*256=240KB, 96*320=240KB, 80*384=240KB (L2=256KB)
  *
- * Both fit L2: 120*256*8=240KB, 96*320*8=240KB (L2=256KB)
- * Deeper KC amortizes B-packing cost over more FMA work per panel.
+ * 8192 runs MT-only to preserve thermal headroom.
+ * Parallel B-packing, per-thread A buffers, schedule(dynamic) for large.
  *
  * Compile:
- *   gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -static -o com6_v26 com6_v26.c -lm
+ *   gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -static -o com6_v28 com6_v28.c -lm
  */
 
 #include <immintrin.h>
@@ -27,12 +30,15 @@
 #define NC  2048
 #define ALIGN 64
 
-/* Adaptive blocking */
+/* Three-tier blocking */
 #define KC_SMALL 256
 #define MC_SMALL 120
-#define KC_LARGE 320
-#define MC_LARGE 96
-#define KC_MAX 320
+#define KC_MED   320
+#define MC_MED   96
+#define KC_LARGE 384
+#define MC_LARGE 80
+
+#define KC_MAX 384
 #define MC_MAX 120
 
 static inline double* aa(size_t c){return(double*)_mm_malloc(c*sizeof(double),ALIGN);}
@@ -378,9 +384,10 @@ static void macro_kernel_1t(const double*pa,const double*pb,
     }
 }
 
-/* Select blocking parameters based on problem size */
+/* Three-tier blocking */
 static void get_blocking(int n, int*pMC, int*pKC){
     if(n <= 1024){*pMC=MC_SMALL;*pKC=KC_SMALL;}
+    else if(n <= 4096){*pMC=MC_MED;*pKC=KC_MED;}
     else{*pMC=MC_LARGE;*pKC=KC_LARGE;}
 }
 
@@ -416,6 +423,9 @@ static void com6_multiply(const double*__restrict__ A,
         for(int t=0;t<nthreads;t++) pa_bufs[t] = aa((size_t)MC_MAX*KC_MAX);
         double* pb = aa((size_t)KC_MAX*NC);
 
+        /* Use dynamic scheduling for large matrices to handle load imbalance */
+        int use_dynamic = (n >= 4096);
+
         for(int jc=0;jc<n;jc+=NC){
             int nc=(jc+NC<=n)?NC:n-jc;
             for(int pc=0;pc<n;pc+=kc_blk){
@@ -427,6 +437,7 @@ static void com6_multiply(const double*__restrict__ A,
                     int nt = omp_get_num_threads();
                     double* pa = pa_bufs[tid];
 
+                    /* Parallel B-packing */
                     int npanels = (nc + NR - 1) / NR;
                     int panels_per = (npanels + nt - 1) / nt;
                     int p0 = tid * panels_per;
@@ -440,11 +451,20 @@ static void com6_multiply(const double*__restrict__ A,
 
                     #pragma omp barrier
 
-                    #pragma omp for schedule(static)
-                    for(int ic=0;ic<n;ic+=mc_blk){
-                        int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
-                        pack_A(A,pa,mc,kc,n,ic,pc);
-                        macro_kernel_1t(pa,pb,C,mc,nc,kc,n,ic,jc);
+                    if(use_dynamic){
+                        #pragma omp for schedule(dynamic,1)
+                        for(int ic=0;ic<n;ic+=mc_blk){
+                            int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
+                            pack_A(A,pa,mc,kc,n,ic,pc);
+                            macro_kernel_1t(pa,pb,C,mc,nc,kc,n,ic,jc);
+                        }
+                    }else{
+                        #pragma omp for schedule(static)
+                        for(int ic=0;ic<n;ic+=mc_blk){
+                            int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
+                            pack_A(A,pa,mc,kc,n,ic,pc);
+                            macro_kernel_1t(pa,pb,C,mc,nc,kc,n,ic,jc);
+                        }
                     }
                 }
             }
@@ -493,12 +513,14 @@ int main(void){
     #endif
 
     printf("====================================================================\n");
-    printf("  COM6 v28 - Large Sizes + Adaptive Blocking (%d threads)\n",nth);
-    printf("  n<=1024: MC=%d KC=%d | n>1024: MC=%d KC=%d\n",MC_SMALL,KC_SMALL,MC_LARGE,KC_LARGE);
-    printf("  8x unrolled ASM micro-kernel, parallel B-pack\n");
+    printf("  COM6 v28 - Pure BLIS + 8192 Support (%d threads)\n",nth);
+    printf("  n<=1024: MC=%d KC=%d\n",MC_SMALL,KC_SMALL);
+    printf("  n<=4096: MC=%d KC=%d\n",MC_MED,KC_MED);
+    printf("  n>=8192: MC=%d KC=%d (deep KC for huge matrices)\n",MC_LARGE,KC_LARGE);
+    printf("  8x unrolled ASM micro-kernel, dynamic scheduling for large\n");
     printf("====================================================================\n\n");
 
-    int sizes[]={512,1024,2048,4096,8192};
+    int sizes[]={256,512,1024,2048,4096,8192};
     int ns=sizeof(sizes)/sizeof(sizes[0]);
     printf("%-10s | %10s | %10s | %8s | %8s | %s\n","Size","1-thread","MT","GF(1T)","GF(MT)","Verify");
     printf("---------- | ---------- | ---------- | -------- | -------- | ------\n");
@@ -508,37 +530,68 @@ int main(void){
         double*A=aa(nn),*B=aa(nn),*C1=aa(nn),*C2=aa(nn);
         srand(42);randf(A,n);randf(B,n);
 
-        int do_1t = (n <= 2048);  /* skip 1T for >=4096 (too slow, thermals) */
-        int runs = (n<=1024)?5:(n<=2048)?3:2;
+        /* 8192: MT only (1T would take ~30s and cook the CPU) */
+        int skip_1t = (n >= 8192);
 
-        double best_1=1e30, gf1=0;
-        if(do_1t){
+        double best_1=0, gf1=0;
+        if(!skip_1t){
+            /* Warmup */
             com6_multiply_1t(A,B,C1,n);
-            for(int r=0;r<runs;r++){double t0=now();com6_multiply_1t(A,B,C1,n);double t=now()-t0;if(t<best_1)best_1=t;}
+            int runs=(n<=1024)?5:(n<=2048)?3:2;
+            best_1=1e30;
+            for(int r=0;r<runs;r++){
+                double t0=now();com6_multiply_1t(A,B,C1,n);double t=now()-t0;
+                if(t<best_1)best_1=t;
+            }
             gf1=(2.0*n*n*(double)n)/(best_1*1e9);
         }
 
+        /* MT benchmark */
         com6_multiply(A,B,C2,n);
+        int runs_mt=(n<=1024)?5:(n<=2048)?3:(n<=4096)?2:2;
         double best_a=1e30;
-        for(int r=0;r<runs;r++){double t0=now();com6_multiply(A,B,C2,n);double t=now()-t0;if(t<best_a)best_a=t;}
+        for(int r=0;r<runs_mt;r++){
+            double t0=now();com6_multiply(A,B,C2,n);double t=now()-t0;
+            if(t<best_a)best_a=t;
+        }
         double gfa=(2.0*n*n*(double)n)/(best_a*1e9);
 
+        /* Verify */
         const char*v;
-        if(n<=512){double*Cr=aa(nn);naive(A,B,Cr,n);
-            double e=maxerr(C2,Cr,n);if(do_1t){double e1=maxerr(C1,Cr,n);if(e1>e)e=e1;}
+        if(n<=512){
+            double*Cr=aa(nn);naive(A,B,Cr,n);
+            double e=fmax(skip_1t?0:maxerr(C1,Cr,n),maxerr(C2,Cr,n));
             v=e<1e-6?"OK":"FAIL";af(Cr);
-        }else if(do_1t){v=maxerr(C1,C2,n)<1e-6?"OK":"FAIL";}
-        else{v="--";}
+        }else if(!skip_1t){
+            /* Cross-verify 1T vs MT */
+            v=maxerr(C1,C2,n)<1e-6?"OK":"FAIL";
+        }else{
+            /* For 8192: spot check row 0 with naive */
+            double*row_ref=(double*)calloc(n,sizeof(double));
+            for(int k=0;k<n;k++){double a=A[0*n+k];for(int j=0;j<n;j++)row_ref[j]+=a*B[k*n+j];}
+            double e=0;for(int j=0;j<n;j++){double d=fabs(C2[j]-row_ref[j]);if(d>e)e=d;}
+            v=e<1e-6?"OK":"FAIL";
+            free(row_ref);
+        }
 
-        if(do_1t)
+        if(skip_1t)
+            printf("%4dx%-5d | %10s | %8.1f ms | %8s | %6.1f   | %s\n",
+                   n,n,"--",best_a*1000,"--",gfa,v);
+        else
             printf("%4dx%-5d | %8.1f ms | %8.1f ms | %6.1f   | %6.1f   | %s\n",
                    n,n,best_1*1000,best_a*1000,gf1,gfa,v);
-        else
-            printf("%4dx%-5d | %10s | %8.1f ms | %8s | %6.1f   | %s\n",
-                   n,n,"skip",best_a*1000,"--",gfa,v);
 
         af(A);af(B);af(C1);af(C2);
+
+        /* Cooldown between sizes to fight thermal throttling */
+        if(si < ns-1){
+            fflush(stdout);
+            int cool = (n >= 4096) ? 5 : 3;
+            struct timespec ts={.tv_sec=cool,.tv_nsec=0};
+            nanosleep(&ts,NULL);
+        }
     }
-    printf("\nBest of both worlds: small-size tuning + large-size deep-KC\n");
+    printf("\nPure BLIS all sizes - no Strassen overhead, deep KC for 8192+\n");
+    printf("8192x8192 = %.1f GFLOP operation\n", 2.0*8192*8192*8192.0/1e9);
     return 0;
 }
