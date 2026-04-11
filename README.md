@@ -17,7 +17,25 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v91 - Latest)
+## COM6 Matrix Multiplication Results (v92 - Latest)
+
+### v92 vs OpenBLAS MT (back-to-back, 30s cooldown, same thermal conditions)
+
+| Size | OpenBLAS MT | COM6 v92 MT | Ratio | Winner |
+|------|-------------|-------------|-------|--------|
+| 512x512 | 23.8 GF | **35.0 GF** | **1.47x** | **COM6** |
+| 1024x1024 | 27.1 GF | **37.7 GF** | **1.39x** | **COM6** |
+| 2048x2048 | 34.5 GF | **48.5 GF** | **1.41x** | **COM6** |
+| 8192x8192 | 26.4 GF | **41.5 GF** | **1.57x** | **COM6** |
+
+**COM6 wins all 4 sizes.** Beats OpenBLAS by 39-57%. Dynamic scheduling helps under thermal throttling.
+
+### v92 Key Changes: Dynamic Scheduling + 2x B-Pack
+- **schedule(dynamic,2) for n>=2048**: Thermal throttling on 15W laptop causes uneven thread speeds. Dynamic dispatch lets fast threads steal work from throttled threads.
+- **2x k-unrolled B-packing**: Process 2 rows per iteration in full NR=8 panels. Halves loop overhead.
+- **Reverse benchmark order**: 8192 first when CPU is coldest.
+- **All v91 features**: Beta-0/1 kernels, C-prefetch, CLI mode, MC=48 for small MT.
+- **CLI mode**: `./com6_v92 <size> [mt|1t]` for fair cold-CPU benchmarking.
 
 ### v91 Cold-Start Performance (isolated single-size tests, 8 threads, i7-10510U)
 
@@ -435,18 +453,21 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 | **v73** | **MT-specific blocking: MC=48 for small MT gives +17% at 512, +37% at 1024 vs v72** | **84.4** (2048 MT), **71.5** (8192 MT) |
 | **v74** | **Memset elimination: beta0/beta1 two-kernel split, no memset needed — +19% at 8192** | **79.8** (8192 MT), **88.6** (1024 MT) |
 | **v75** | **NT stores for large beta=0: vmovntpd bypasses cache for n>=2048 — +5% at 8192** | **106.4** (1024 MT), **83.6** (8192 MT) |
+| v76-v90 | Various experiments (persistent pools, NT stores, A-reuse, etc.) | varies |
+| **v91** | **Back to basics: v26 arch + beta-0/1 kernels + MC=48 MT + CLI mode** | **110.0** (2048 MT), **81.5** (8192 MT) |
+| **v92** | **Dynamic sched(2) for n>=2048 + 2x B-pack unroll — 1.57x vs BLAS at 8192** | **48.5** (2048 MT warm), 1.39-1.57x vs BLAS |
 
 ## Building
 
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v75: AVX2 + OpenMP + 3-kernel beta + NT stores + MT-specific blocking (recommended, latest)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v75 com6_v75.c -lm
-./com6_v75           # full benchmark (256-8192, 4s cooldown between sizes)
-./com6_v75 4096 mt   # single-size MT cold CPU test
-./com6_v75 512 1t    # single-size 1T test
-./com6_v75 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
+# v92: AVX2 + OpenMP + beta-0/1 kernels + dynamic sched + 2x B-pack (recommended, latest)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v92 com6_v92.c -lm
+./com6_v92           # full benchmark (8192-256, reverse order)
+./com6_v92 4096 mt   # single-size MT cold CPU test
+./com6_v92 512 1t    # single-size 1T test
+./com6_v92 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
 
 # v38: AVX2 + OpenMP
 gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v38 com6_v38.c -lm
