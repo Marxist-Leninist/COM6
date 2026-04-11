@@ -1,4 +1,4 @@
-"""COM6 v86 vs OpenBLAS — Fair interleaved comparison
+"""COM6 v85 vs OpenBLAS — Fair interleaved comparison
 Tests both at each size with cooling to equalize thermal conditions."""
 import numpy as np
 import time
@@ -49,10 +49,10 @@ def bench_com6_single(exe, n, mode="mt"):
 
 if __name__ == "__main__":
     sizes = [512, 1024, 2048, 4096, 8192]
-    exe = "C:/Users/Scott/com6-matmul/com6_v86.exe"
+    exe = "C:/Users/Scott/com6_v85.exe"
 
     print("=" * 80)
-    print("  COM6 v86 vs OpenBLAS (numpy) -- Fair Interleaved Comparison")
+    print("  COM6 v85 vs OpenBLAS (numpy) -- Fair Interleaved Comparison")
     print("  (10s cooling between each test)")
     print("=" * 80)
     print()
