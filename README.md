@@ -2,7 +2,7 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication at 512+ sizes.**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 85 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, OpenMP parallelization with adaptive MC/KC/NC blocking, separate 1T/MT blocking functions, three micro-kernel variants (beta0/beta1/beta0-NT), memset elimination, 2x-unrolled B-panel packing, C-prefetch at kernel entry, KC=n one-shot for small sizes, pre-allocated buffers, and OMP thread pool warmup.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 95 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, JC-parallel threading (private B-panels, zero barriers), Strassen hybrid for 8192+ (Winograd variant, 7 sub-muls), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, C-prefetch at kernel entry, 2x-unrolled B-panel packing, and reverse benchmark ordering for thermal management.
 
 ## COM7NN Transformer vs Standard Transformer
 
@@ -17,7 +17,36 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v85 - Latest)
+## COM6 Matrix Multiplication Results (v95 - Latest)
+
+### v95: Strassen-Hybrid + JC-Parallel (latest)
+
+v95 adds single-level Strassen (Winograd variant) for n>=8192: 7 sub-multiplications of (n/2)x(n/2) instead of 8, saving 12.5% of FLOPs. Each sub-multiply delegates to the full JC-parallel BLIS GEMM. Submatrix additions are O(n^2) — negligible overhead.
+
+For n<8192: identical to v94 (JC-parallel for n>=2048, IC-parallel for n<2048).
+
+**v95 vs v94 head-to-head at 8192 (matched thermal conditions):**
+
+| Version | 8192 MT | Improvement |
+|---------|---------|-------------|
+| v94 | 26.6 GF | baseline |
+| **v95** | **29.0 GF** | **+8.6%** |
+
+### v94: JC-Parallel for Large + Adaptive NC
+
+For n>=2048: JC-parallel mode where each thread owns a column slab with private B-panel (NC=1024). Zero barriers, zero C write contention.
+
+For n<2048: IC-parallel with shared B-panel (v26 approach, proven best for small/medium). MC_MT=48 for n<=1024 (better thread balance).
+
+Key features: beta-0/beta-1 micro-kernels (skip C load on first pc iteration), C-prefetch at kernel entry, 2x B-pack unroll, reverse benchmark order (largest first for cold CPU).
+
+### v85 (Xeon results) — see below
+
+---
+
+## Historical Results
+
+### v85 vs OpenBLAS MT — Xeon Skylake (historical)
 
 ### v85 vs OpenBLAS MT — Xeon Skylake 16-core (no thermal throttle)
 
