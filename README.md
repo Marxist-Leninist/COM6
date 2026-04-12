@@ -2,7 +2,7 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication at 512+ sizes.**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 95 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, JC-parallel threading (private B-panels, zero barriers), Strassen hybrid for 8192+ (Winograd variant, 7 sub-muls), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, C-prefetch at kernel entry, 2x-unrolled B-panel packing, and reverse benchmark ordering for thermal management.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 96 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, best-of-both dispatch (IC-parallel for 4096, JC-parallel for 2048, Strassen for 8192+), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, C-prefetch at kernel entry, 2x-unrolled B-panel packing, and reverse benchmark ordering for thermal management.
 
 ## COM7NN Transformer vs Standard Transformer
 
@@ -17,28 +17,36 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v95 - Latest)
+## COM6 Matrix Multiplication Results (v96 - Latest)
 
-### v95: Strassen-Hybrid + JC-Parallel (latest)
+### v96: Best-of-Both Dispatch (latest)
 
-v95 adds single-level Strassen (Winograd variant) for n>=8192: 7 sub-multiplications of (n/2)x(n/2) instead of 8, saving 12.5% of FLOPs. Each sub-multiply delegates to the full JC-parallel BLIS GEMM. Submatrix additions are O(n^2) — negligible overhead.
+v96 optimizes the threading dispatch based on L3 cache analysis:
+- **n>=8192**: Strassen (Winograd variant, 7 sub-muls) — shorter bursts sustain higher clocks on 15W TDP
+- **n>=4096**: IC-parallel (shared B-panel: 5MB fits 8MB L3) — +47% vs v95's Strassen at 8192
+- **2048<=n<4096**: JC-parallel (private B-panels, zero barriers)
+- **n<2048**: IC-parallel (proven best for small/medium)
 
-For n<8192: identical to v94 (JC-parallel for n>=2048, IC-parallel for n<2048).
+The key insight: Strassen's 4096-sized sub-multiplications now dispatch to IC-parallel (the faster path at that size), chaining the optimizations.
 
-**v95 vs v94 head-to-head at 8192 (matched thermal conditions):**
+**v96 vs v95 (matched thermal conditions — 90s cooldown):**
 
-| Version | 8192 MT | Improvement |
-|---------|---------|-------------|
-| v94 | 26.6 GF | baseline |
-| **v95** | **29.0 GF** | **+8.6%** |
+| Size | v95 | v96 | Improvement |
+|------|-----|-----|-------------|
+| 8192 MT | 44.4 GF | **65.3 GF** | **+47%** |
+| 4096 MT | 73.2 GF | **75.1 GF** | +3% |
+| 2048 MT | 75.2 GF | **76.9 GF** | +2% |
+| 1024 MT | 80.4 GF | **89.9 GF** | +12% |
+| 512 MT | 61.0 GF | **62.7 GF** | +3% |
+| 512 1T | 37.2 GF | **39.5 GF** | +6% |
+
+### v95: Strassen-Hybrid + JC-Parallel
+
+v95 added single-level Strassen (Winograd variant) for n>=8192: 7 sub-multiplications of (n/2)x(n/2) saving 12.5% of FLOPs. For n<8192: JC-parallel for n>=2048, IC-parallel for n<2048.
 
 ### v94: JC-Parallel for Large + Adaptive NC
 
-For n>=2048: JC-parallel mode where each thread owns a column slab with private B-panel (NC=1024). Zero barriers, zero C write contention.
-
-For n<2048: IC-parallel with shared B-panel (v26 approach, proven best for small/medium). MC_MT=48 for n<=1024 (better thread balance).
-
-Key features: beta-0/beta-1 micro-kernels (skip C load on first pc iteration), C-prefetch at kernel entry, 2x B-pack unroll, reverse benchmark order (largest first for cold CPU).
+JC-parallel mode for n>=2048: each thread owns a column slab with private B-panel (NC=1024). Zero barriers, zero C write contention. IC-parallel for n<2048. Beta-0/beta-1 micro-kernels, C-prefetch, 2x B-pack unroll.
 
 ### v85 (Xeon results) — see below
 
