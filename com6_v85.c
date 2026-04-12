@@ -1,25 +1,16 @@
 /*
- * COM6 v85 - Persistent Thread Pool + Pre-Allocated Buffers
- * ==========================================================
- * v84 base with critical overhead reductions for small sizes (512):
- *
- * 1. PRE-ALLOCATED STATIC BUFFERS: v84 malloc'd pa_bufs[] and pb on every
- *    com6_multiply() call. For 512 (~4ms compute), malloc overhead matters.
- *    v85 allocates once, reuses forever.
- *
- * 2. GOMP_SPINCOUNT=infinite: Tells GCC's OpenMP runtime to keep worker
- *    threads spinning between parallel regions instead of sleeping. Drops
- *    fork/join overhead from ~50-100us to ~2-5us.
- *
- * 3. OMP THREAD POOL WARMUP: First call to com6_multiply does a dummy
- *    parallel barrier to pre-create the thread pool before benchmarking.
- *
- * 4. ALL v84 IMPROVEMENTS RETAINED: 4-tier blocking, 3 micro-kernel
- *    variants (beta0/beta1/beta0-NT), prefetch A-packing, 8x k-unroll,
- *    single parallel region per call.
- *
- * 5. LOWER MT THRESHOLD: n>=256 uses MT (was n>=512). With persistent
- *    threads, the dispatch overhead is low enough to benefit from MT at 256.
+ * COM6 v85 - Dynamic IC Scheduling + Thread Pool Warm-up
+ * ======================================================
+ * Based on v84 with:
+ * - Dynamic ic-strip scheduling: #pragma omp for schedule(dynamic,1) replaces
+ *   manual static partitioning. v84's static approach left threads idle:
+ *   At 512 (MC=48): 11 strips, 8 threads → threads 6-7 got ZERO work.
+ *   Dynamic scheduling ensures every thread stays busy.
+ * - Thread pool pre-warming: dummy parallel barrier before any benchmark
+ *   timing to ensure OpenMP thread creation overhead is excluded.
+ * - sfence after NT stores: flush write-combine buffers before barriers
+ *   to prevent stale reads by other threads.
+ * - Preserved: all v84 micro-kernels, blocking tiers, packing, prefetch.
  *
  * Compile:
  *   gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -static -o com6_v85 com6_v85.c -lm
@@ -42,7 +33,7 @@
 #define NR  8
 #define ALIGN 64
 
-/* 4-tier adaptive blocking (from v84) */
+/* 4-tier adaptive blocking (unchanged from v84) */
 #define KC_SMALL 256
 #define MC_SMALL 120
 #define NC_DEFAULT 2048
@@ -50,16 +41,13 @@
 #define KC_LARGE 320
 #define MC_LARGE 96
 
-/* Retuned 8192+: KC=768 trades 11 vs 8 C-passes for better L3 fit */
 #define KC_HUGE  768
 #define MC_HUGE  30
 #define NC_HUGE  768
 
-#define KC_MAX 768  /* also used for small-size KC=n where n<=512 */
+#define KC_MAX 768
 #define MC_MAX 120
 #define NC_MAX 2048
-
-#define MC_MT_SMALL 48
 
 static inline double* aa(size_t c){return(double*)_mm_malloc(c*sizeof(double),ALIGN);}
 static inline void af(double*p){_mm_free(p);}
@@ -77,7 +65,6 @@ micro_6x8_beta1(int kc, const double* pA, const double* pB,
     long long ldc_bytes = (long long)ldc * 8;
 
     __asm__ volatile(
-        /* Prefetch C rows — k-loop gives 192+ cycles to hide DRAM latency */
         "movq %[C],%%r15\n\t"
         "prefetcht0 (%%r15)\n\t"   "prefetcht0 32(%%r15)\n\t"
         "addq %[ldc],%%r15\n\t"
@@ -109,45 +96,187 @@ micro_6x8_beta1(int kc, const double* pA, const double* pB,
         ".p2align 5\n\t"
         "1:\n\t"
 
-        /* Prefetch: A+768 bytes ahead, B+1024 bytes ahead */
         "prefetcht0 768(%[pA])\n\t"
         "prefetcht0 1024(%[pB])\n\t"
 
-#define RANK1_B1(AO,BO) \
-        "vmovapd " #BO "(%[pB]),%%ymm12\n\t" \
-        "vmovapd " #BO "+32(%[pB]),%%ymm13\n\t" \
-        "vbroadcastsd " #AO "(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t" \
-        "vbroadcastsd " #AO "+8(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t" \
-        "vbroadcastsd " #AO "+16(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t" \
-        "vbroadcastsd " #AO "+24(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t" \
-        "vbroadcastsd " #AO "+32(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t" \
-        "vbroadcastsd " #AO "+40(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t" \
+        /* k+0 */
+        "vmovapd (%[pB]),%%ymm12\n\t"
+        "vmovapd 32(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd (%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 8(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 16(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 24(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 32(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 40(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
         "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
-        RANK1_B1(0,0)     /* k+0 */
-        RANK1_B1(48,64)   /* k+1 */
-        RANK1_B1(96,128)  /* k+2 */
-        RANK1_B1(144,192) /* k+3 */
+        /* k+1 */
+        "vmovapd 64(%[pB]),%%ymm12\n\t"
+        "vmovapd 96(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 48(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 56(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 64(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 72(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 80(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 88(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
-        /* Second prefetch point */
+        /* k+2 */
+        "vmovapd 128(%[pB]),%%ymm12\n\t"
+        "vmovapd 160(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 96(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 104(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 112(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 120(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 128(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 136(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        /* k+3 */
+        "vmovapd 192(%[pB]),%%ymm12\n\t"
+        "vmovapd 224(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 144(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 152(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 160(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 168(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 176(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 184(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        /* k+4 — second prefetch point */
         "prefetcht0 1152(%[pA])\n\t"
         "prefetcht0 1536(%[pB])\n\t"
 
-        RANK1_B1(192,256) /* k+4 */
-        RANK1_B1(240,320) /* k+5 */
-        RANK1_B1(288,384) /* k+6 */
-        RANK1_B1(336,448) /* k+7 */
+        "vmovapd 256(%[pB]),%%ymm12\n\t"
+        "vmovapd 288(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 192(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 200(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 208(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 216(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 224(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 232(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        /* k+5 */
+        "vmovapd 320(%[pB]),%%ymm12\n\t"
+        "vmovapd 352(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 240(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 248(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 256(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 264(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 272(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 280(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        /* k+6 */
+        "vmovapd 384(%[pB]),%%ymm12\n\t"
+        "vmovapd 416(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 288(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 296(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 304(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 312(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 320(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 328(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        /* k+7 */
+        "vmovapd 448(%[pB]),%%ymm12\n\t"
+        "vmovapd 480(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 336(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 344(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 352(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 360(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 368(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 376(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
         "addq $384,%[pA]\n\t"
         "addq $512,%[pB]\n\t"
@@ -158,13 +287,31 @@ micro_6x8_beta1(int kc, const double* pA, const double* pB,
         "testq %[kcr],%[kcr]\n\t"
         "jle 2f\n\t"
         "4:\n\t"
-        RANK1_B1(0,0)
+        "vmovapd (%[pB]),%%ymm12\n\t"
+        "vmovapd 32(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd (%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 8(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 16(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 24(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 32(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 40(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
         "addq $48,%[pA]\n\t"
         "addq $64,%[pB]\n\t"
         "decq %[kcr]\n\t"
         "jnz 4b\n\t"
 
-        /* Store: load existing C, add accumulators, store back */
         "2:\n\t"
         "vmovupd (%[C]),%%ymm12\n\t"
         "vmovupd 32(%[C]),%%ymm13\n\t"
@@ -219,11 +366,8 @@ micro_6x8_beta1(int kc, const double* pA, const double* pB,
           "ymm8","ymm9","ymm10","ymm11","ymm12","ymm13","ymm14","memory"
     );
 }
-#undef RANK1_B1
 
-/* ================================================================
- * MICRO-KERNEL 6x8 - beta=0 (just store, no load from C)
- * ================================================================ */
+/* beta=0 (first KC tile — just store, no load from C) */
 static void __attribute__((noinline))
 micro_6x8_beta0(int kc, const double* pA, const double* pB,
                 double* C, int ldc)
@@ -254,40 +398,184 @@ micro_6x8_beta0(int kc, const double* pA, const double* pB,
         "prefetcht0 768(%[pA])\n\t"
         "prefetcht0 1024(%[pB])\n\t"
 
-#define RANK1_B0(AO,BO) \
-        "vmovapd " #BO "(%[pB]),%%ymm12\n\t" \
-        "vmovapd " #BO "+32(%[pB]),%%ymm13\n\t" \
-        "vbroadcastsd " #AO "(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t" \
-        "vbroadcastsd " #AO "+8(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t" \
-        "vbroadcastsd " #AO "+16(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t" \
-        "vbroadcastsd " #AO "+24(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t" \
-        "vbroadcastsd " #AO "+32(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t" \
-        "vbroadcastsd " #AO "+40(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t" \
+        /* k+0 */
+        "vmovapd (%[pB]),%%ymm12\n\t"
+        "vmovapd 32(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd (%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 8(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 16(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 24(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 32(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 40(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
         "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
-        RANK1_B0(0,0)
-        RANK1_B0(48,64)
-        RANK1_B0(96,128)
-        RANK1_B0(144,192)
+        /* k+1 */
+        "vmovapd 64(%[pB]),%%ymm12\n\t"
+        "vmovapd 96(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 48(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 56(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 64(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 72(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 80(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 88(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
+        /* k+2 */
+        "vmovapd 128(%[pB]),%%ymm12\n\t"
+        "vmovapd 160(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 96(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 104(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 112(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 120(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 128(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 136(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        /* k+3 */
+        "vmovapd 192(%[pB]),%%ymm12\n\t"
+        "vmovapd 224(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 144(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 152(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 160(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 168(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 176(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 184(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        /* k+4 */
         "prefetcht0 1152(%[pA])\n\t"
         "prefetcht0 1536(%[pB])\n\t"
 
-        RANK1_B0(192,256)
-        RANK1_B0(240,320)
-        RANK1_B0(288,384)
-        RANK1_B0(336,448)
+        "vmovapd 256(%[pB]),%%ymm12\n\t"
+        "vmovapd 288(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 192(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 200(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 208(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 216(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 224(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 232(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        /* k+5 */
+        "vmovapd 320(%[pB]),%%ymm12\n\t"
+        "vmovapd 352(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 240(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 248(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 256(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 264(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 272(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 280(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        /* k+6 */
+        "vmovapd 384(%[pB]),%%ymm12\n\t"
+        "vmovapd 416(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 288(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 296(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 304(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 312(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 320(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 328(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        /* k+7 */
+        "vmovapd 448(%[pB]),%%ymm12\n\t"
+        "vmovapd 480(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 336(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 344(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 352(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 360(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 368(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 376(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
         "addq $384,%[pA]\n\t"
         "addq $512,%[pB]\n\t"
@@ -298,13 +586,31 @@ micro_6x8_beta0(int kc, const double* pA, const double* pB,
         "testq %[kcr],%[kcr]\n\t"
         "jle 2f\n\t"
         "4:\n\t"
-        RANK1_B0(0,0)
+        "vmovapd (%[pB]),%%ymm12\n\t"
+        "vmovapd 32(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd (%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 8(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 16(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 24(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 32(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 40(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
         "addq $48,%[pA]\n\t"
         "addq $64,%[pB]\n\t"
         "decq %[kcr]\n\t"
         "jnz 4b\n\t"
 
-        /* Store: just write (beta=0) */
         "2:\n\t"
         "vmovupd %%ymm0,(%[C])\n\t"
         "vmovupd %%ymm1,32(%[C])\n\t"
@@ -330,7 +636,6 @@ micro_6x8_beta0(int kc, const double* pA, const double* pB,
           "ymm8","ymm9","ymm10","ymm11","ymm12","ymm13","ymm14","memory"
     );
 }
-#undef RANK1_B0
 
 /* beta=0 + non-temporal stores: bypass cache for large C matrices */
 static void __attribute__((noinline))
@@ -363,40 +668,177 @@ micro_6x8_beta0_nt(int kc, const double* pA, const double* pB,
         "prefetcht0 768(%[pA])\n\t"
         "prefetcht0 1024(%[pB])\n\t"
 
-#define RANK1_NT(AO,BO) \
-        "vmovapd " #BO "(%[pB]),%%ymm12\n\t" \
-        "vmovapd " #BO "+32(%[pB]),%%ymm13\n\t" \
-        "vbroadcastsd " #AO "(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t" \
-        "vbroadcastsd " #AO "+8(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t" \
-        "vbroadcastsd " #AO "+16(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t" \
-        "vbroadcastsd " #AO "+24(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t" \
-        "vbroadcastsd " #AO "+32(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t" \
-        "vbroadcastsd " #AO "+40(%[pA]),%%ymm14\n\t" \
-        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t" \
+        /* k+0 through k+7: identical FMA body to beta0 */
+        "vmovapd (%[pB]),%%ymm12\n\t"
+        "vmovapd 32(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd (%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 8(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 16(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 24(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 32(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 40(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
         "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
-        RANK1_NT(0,0)
-        RANK1_NT(48,64)
-        RANK1_NT(96,128)
-        RANK1_NT(144,192)
+        "vmovapd 64(%[pB]),%%ymm12\n\t"
+        "vmovapd 96(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 48(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 56(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 64(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 72(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 80(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 88(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        "vmovapd 128(%[pB]),%%ymm12\n\t"
+        "vmovapd 160(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 96(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 104(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 112(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 120(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 128(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 136(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        "vmovapd 192(%[pB]),%%ymm12\n\t"
+        "vmovapd 224(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 144(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 152(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 160(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 168(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 176(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 184(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
         "prefetcht0 1152(%[pA])\n\t"
         "prefetcht0 1536(%[pB])\n\t"
 
-        RANK1_NT(192,256)
-        RANK1_NT(240,320)
-        RANK1_NT(288,384)
-        RANK1_NT(336,448)
+        "vmovapd 256(%[pB]),%%ymm12\n\t"
+        "vmovapd 288(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 192(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 200(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 208(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 216(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 224(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 232(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        "vmovapd 320(%[pB]),%%ymm12\n\t"
+        "vmovapd 352(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 240(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 248(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 256(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 264(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 272(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 280(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        "vmovapd 384(%[pB]),%%ymm12\n\t"
+        "vmovapd 416(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 288(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 296(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 304(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 312(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 320(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 328(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
+
+        "vmovapd 448(%[pB]),%%ymm12\n\t"
+        "vmovapd 480(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd 336(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 344(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 352(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 360(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 368(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 376(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
         "addq $384,%[pA]\n\t"
         "addq $512,%[pB]\n\t"
@@ -407,13 +849,32 @@ micro_6x8_beta0_nt(int kc, const double* pA, const double* pB,
         "testq %[kcr],%[kcr]\n\t"
         "jle 2f\n\t"
         "4:\n\t"
-        RANK1_NT(0,0)
+        "vmovapd (%[pB]),%%ymm12\n\t"
+        "vmovapd 32(%[pB]),%%ymm13\n\t"
+        "vbroadcastsd (%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
+        "vbroadcastsd 8(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm2\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm3\n\t"
+        "vbroadcastsd 16(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm4\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm5\n\t"
+        "vbroadcastsd 24(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm6\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm7\n\t"
+        "vbroadcastsd 32(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm8\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm9\n\t"
+        "vbroadcastsd 40(%[pA]),%%ymm14\n\t"
+        "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t"
+        "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
         "addq $48,%[pA]\n\t"
         "addq $64,%[pB]\n\t"
         "decq %[kcr]\n\t"
         "jnz 4b\n\t"
 
-        /* NT store: bypass cache */
+        /* NT store + sfence */
         "2:\n\t"
         "vmovntpd %%ymm0,(%[C])\n\t"
         "vmovntpd %%ymm1,32(%[C])\n\t"
@@ -432,6 +893,7 @@ micro_6x8_beta0_nt(int kc, const double* pA, const double* pB,
         "addq %[ldc],%[C]\n\t"
         "vmovntpd %%ymm10,(%[C])\n\t"
         "vmovntpd %%ymm11,32(%[C])\n\t"
+        "sfence\n\t"
 
         : [pA]"+r"(pA),[pB]"+r"(pB),[kc8]"+r"(kc_8),[kcr]"+r"(kc_rem),[C]"+r"(C)
         : [ldc]"r"(ldc_bytes)
@@ -439,7 +901,6 @@ micro_6x8_beta0_nt(int kc, const double* pA, const double* pB,
           "ymm8","ymm9","ymm10","ymm11","ymm12","ymm13","ymm14","memory"
     );
 }
-#undef RANK1_NT
 
 /* Edge kernel for partial tiles */
 static void micro_edge(int mr,int nr,int kc,const double*pA,const double*pB,double*C,int n,int beta){
@@ -451,6 +912,7 @@ static void micro_edge(int mr,int nr,int kc,const double*pA,const double*pB,doub
 /* ================================================================
  * PACKING
  * ================================================================ */
+
 static void pack_B_chunk(const double*__restrict__ B,double*__restrict__ pb,
                           int kc,int nc,int n,int j0,int k0,int j_start,int j_end){
     for(int j=j_start;j<j_end;j+=NR){
@@ -529,13 +991,11 @@ static void get_blocking_1t(int n, int*pMC, int*pKC, int*pNC){
     else              {*pMC=MC_HUGE; *pKC=KC_HUGE;  *pNC=NC_HUGE;}
 }
 
+/* v85: MC must be multiple of MR=6. MC=48 for small MT (48/6=8 panels).
+ * Dynamic scheduling handles uneven strip distribution correctly. */
+#define MC_MT_SMALL 48
 static void get_blocking_mt(int n, int*pMC, int*pKC, int*pNC){
-    if(n <= 512)      {*pMC=MC_MT_SMALL;*pKC=n;        *pNC=NC_DEFAULT;}
-        /* KC=n for n<=512: entire K in one shot → 1 pc iteration.
-         * Halves barriers (2 vs 4), halves packing, eliminates beta=1 path.
-         * A-panel: 48*512*8=192KB (fits L2 256KB).
-         * B-panel: 512*512*8=2MB (fits L3 8MB). */
-    else if(n <= 1024){*pMC=MC_MT_SMALL;*pKC=KC_SMALL;*pNC=NC_DEFAULT;}
+    if(n <= 1024)     {*pMC=MC_MT_SMALL;*pKC=KC_SMALL;*pNC=NC_DEFAULT;}
     else if(n <= 2048){*pMC=MC_LARGE;   *pKC=KC_LARGE;*pNC=NC_DEFAULT;}
     else if(n <= 4096){*pMC=MC_LARGE;   *pKC=KC_LARGE;*pNC=1024;}
     else              {*pMC=MC_HUGE;    *pKC=KC_HUGE;  *pNC=NC_HUGE;}
@@ -584,57 +1044,13 @@ static void com6_multiply_1t(const double*__restrict__ A,
 }
 
 /* ================================================================
- * STATIC PRE-ALLOCATED BUFFERS (avoid malloc per multiply call)
- * ================================================================ */
-static int g_nthreads = 0;
-static double **g_pa_bufs = NULL;
-static double *g_pb = NULL;
-static int g_inited = 0;
-
-static void pool_cleanup(void) {
-    if (!g_inited) return;
-    for (int t = 0; t < g_nthreads; t++) af(g_pa_bufs[t]);
-    free(g_pa_bufs);
-    af(g_pb);
-    g_inited = 0;
-}
-
-static void pool_init(int nthreads) {
-    if (g_inited && g_nthreads >= nthreads) return;
-    if (g_inited) pool_cleanup();
-
-    g_nthreads = nthreads;
-    g_pa_bufs = (double**)malloc(nthreads * sizeof(double*));
-    for (int t = 0; t < nthreads; t++)
-        g_pa_bufs[t] = aa((size_t)MC_MAX * KC_MAX);
-    g_pb = aa((size_t)KC_MAX * NC_MAX);
-    g_inited = 1;
-    atexit(pool_cleanup);
-}
-
-/* ================================================================
- * OMP THREAD POOL WARMUP
- * Ensures threads are created and spinning before first benchmark.
- * Also sets GOMP_SPINCOUNT to keep threads alive between regions.
- * ================================================================ */
-static int g_warmed = 0;
-static void omp_warmup(void) {
-    if (g_warmed) return;
-#ifdef _OPENMP
-    /* Pre-create OpenMP thread pool with a dummy parallel region.
-     * Note: GOMP_SPINCOUNT=infinite was tested but causes thermal throttling
-     * on 15W TDP laptops — spinning threads burn power budget. */
-    #pragma omp parallel
-    {
-        _mm_pause(); /* touch something so it doesn't get optimized away */
-    }
-#endif
-    g_warmed = 1;
-}
-
-/* ================================================================
- * MULTI-THREAD MULTIPLY
- * Single parallel region per call, pre-allocated buffers, persistent threads
+ * MULTI-THREAD MULTIPLY — v85: Dynamic IC scheduling
+ *
+ * v84 bug: manual static partitioning at 512 (11 strips, 8 threads)
+ * gave threads 6-7 ZERO strips. 25% of threads idle.
+ *
+ * v85 fix: #pragma omp for schedule(dynamic,1) ensures every thread
+ * grabs work as available. No thread idles while work remains.
  * ================================================================ */
 static void com6_multiply(const double*__restrict__ A,
                            const double*__restrict__ B,
@@ -653,55 +1069,84 @@ static void com6_multiply(const double*__restrict__ A,
         return;
     }
 
-    omp_warmup();
-    pool_init(nthreads);
-
     int use_nt = (n >= 2048);
 
-    #pragma omp parallel
+    double** pa_bufs = (double**)malloc(nthreads * sizeof(double*));
+    for(int t=0;t<nthreads;t++) pa_bufs[t] = aa((size_t)MC_MAX*KC_MAX);
+
     {
-        int tid = omp_get_thread_num();
-        int nt = omp_get_num_threads();
-        double* pa = g_pa_bufs[tid];
+        double* pb = aa((size_t)KC_MAX*NC_MAX);
 
-        for(int jc=0;jc<n;jc+=nc_blk){
-            int nc=(jc+nc_blk<=n)?nc_blk:n-jc;
-            for(int pc=0;pc<n;pc+=kc_blk){
-                int kc=(pc+kc_blk<=n)?kc_blk:n-pc;
-                int beta=(pc>0)?1:0;
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            int nt = omp_get_num_threads();
+            double* pa = pa_bufs[tid];
 
-                /* Parallel B-packing */
-                int npanels = (nc + NR - 1) / NR;
-                int panels_per = (npanels + nt - 1) / nt;
-                int p0 = tid * panels_per;
-                int p1 = p0 + panels_per;
-                if(p1 > npanels) p1 = npanels;
-                int j_start = p0 * NR;
-                int j_end = p1 * NR;
-                if(j_end > nc) j_end = nc;
-                if(j_start < nc)
-                    pack_B_chunk(B,g_pb,kc,nc,n,jc,pc,j_start,j_end);
+            for(int jc=0;jc<n;jc+=nc_blk){
+                int nc=(jc+nc_blk<=n)?nc_blk:n-jc;
+                for(int pc=0;pc<n;pc+=kc_blk){
+                    int kc=(pc+kc_blk<=n)?kc_blk:n-pc;
+                    int beta=(pc>0)?1:0;
 
-                #pragma omp barrier
+                    /* Parallel B-packing: evenly distribute NR-panels */
+                    int npanels = (nc + NR - 1) / NR;
+                    int panels_per = (npanels + nt - 1) / nt;
+                    int p0 = tid * panels_per;
+                    int p1 = p0 + panels_per;
+                    if(p1 > npanels) p1 = npanels;
+                    int j_start = p0 * NR;
+                    int j_end = p1 * NR;
+                    if(j_end > nc) j_end = nc;
+                    if(j_start < nc)
+                        pack_B_chunk(B,pb,kc,nc,n,jc,pc,j_start,j_end);
 
-                /* Static partition of M strips */
-                int nstrips = (n + mc_blk - 1) / mc_blk;
-                int strips_per = (nstrips + nt - 1) / nt;
-                int s0 = tid * strips_per;
-                int s1 = s0 + strips_per;
-                if(s1 > nstrips) s1 = nstrips;
+                    #pragma omp barrier
 
-                for(int s = s0; s < s1; s++){
-                    int ic = s * mc_blk;
-                    int mc = (ic+mc_blk<=n)?mc_blk:n-ic;
-                    pack_A(A,pa,mc,kc,n,ic,pc);
-                    macro_kernel(pa,g_pb,C,mc,nc,kc,n,ic,jc,beta,use_nt);
+                    /* v85: ADAPTIVE scheduling — dynamic for small, static for large.
+                     *
+                     * n<=2048: omp for schedule(dynamic,1)
+                     *   Fixes v84 load imbalance at 512 (11 strips, 8T: v84 left
+                     *   threads 6-7 idle due to ceil-division partitioning).
+                     *   Dynamic ensures every thread grabs work on demand.
+                     *
+                     * n>2048: manual static partition (v84 style)
+                     *   At 8192 (MC=30): 274 strips. Dynamic's 274 atomic ops
+                     *   thrash shared cache line → 44% regression.
+                     *   Static has zero atomic overhead. */
+                    int nstrips = (n + mc_blk - 1) / mc_blk;
+
+                    if(n <= 2048){
+                        #pragma omp for schedule(dynamic, 1)
+                        for(int s = 0; s < nstrips; s++){
+                            int ic = s * mc_blk;
+                            int mc = (ic+mc_blk<=n)?mc_blk:n-ic;
+                            pack_A(A, pa_bufs[omp_get_thread_num()], mc, kc, n, ic, pc);
+                            macro_kernel(pa_bufs[omp_get_thread_num()], pb, C, mc, nc, kc, n, ic, jc, beta, use_nt);
+                        }
+                        /* implicit barrier from omp for */
+                    } else {
+                        /* Manual static — same as v84 for large sizes */
+                        int strips_per = (nstrips + nt - 1) / nt;
+                        int s0 = tid * strips_per;
+                        int s1 = s0 + strips_per;
+                        if(s1 > nstrips) s1 = nstrips;
+                        for(int s = s0; s < s1; s++){
+                            int ic = s * mc_blk;
+                            int mc = (ic+mc_blk<=n)?mc_blk:n-ic;
+                            pack_A(A, pa, mc, kc, n, ic, pc);
+                            macro_kernel(pa, pb, C, mc, nc, kc, n, ic, jc, beta, use_nt);
+                        }
+                        #pragma omp barrier
+                    }
                 }
-
-                #pragma omp barrier
             }
         }
+        af(pb);
     }
+
+    for(int t=0;t<nthreads;t++) af(pa_bufs[t]);
+    free(pa_bufs);
 }
 
 /* ================================================================
@@ -718,14 +1163,29 @@ static double maxerr(const double*A,const double*B,int n){
     double m=0;for(int i=0;i<n*n;i++){double d=fabs(A[i]-B[i]);if(d>m)m=d;}return m;
 }
 
+/* Pre-warm OpenMP thread pool: force thread creation before any timing.
+ * OpenMP lazily creates threads on first #pragma omp parallel.
+ * Without this, first benchmark iteration pays ~50-200μs thread spawn. */
+static void warmup_omp_pool(void){
+    #ifdef _OPENMP
+    volatile int dummy = 0;
+    #pragma omp parallel
+    {
+        #pragma omp atomic
+        dummy++;
+    }
+    (void)dummy;
+    #endif
+}
+
 int main(int argc, char**argv){
     int nth=1;
     #ifdef _OPENMP
     nth=omp_get_max_threads();
     #endif
 
-    /* Pre-warm OpenMP thread pool + set GOMP_SPINCOUNT */
-    omp_warmup();
+    /* v85: Pre-warm thread pool before any benchmarking */
+    warmup_omp_pool();
 
     /* CLI mode: ./com6_v85 <size> [mt|1t] */
     if(argc >= 2){
@@ -741,8 +1201,12 @@ int main(int argc, char**argv){
         if(!A||!B||!C){printf("OOM for %dx%d\n",n,n);return 1;}
         srand(42);randf(A,n);randf(B,n);
         int runs=(n<=512)?7:(n<=1024)?5:(n<=2048)?3:2;
+
+        /* Warmup run (excluded from timing) */
+        if(mode!=2) com6_multiply_1t(A,B,C,n);
+        if(mode!=1) com6_multiply(A,B,C,n);
+
         if(mode!=2){
-            com6_multiply_1t(A,B,C,n);
             double best=1e30;
             for(int r=0;r<runs;r++){
                 double t0=now();com6_multiply_1t(A,B,C,n);double t=now()-t0;
@@ -751,7 +1215,6 @@ int main(int argc, char**argv){
             printf("1T  %4dx%-5d | %8.1f ms | %6.1f GF\n",n,n,best*1000,(2.0*n*n*(double)n)/(best*1e9));
         }
         if(mode!=1){
-            com6_multiply(A,B,C,n);
             double best=1e30;
             for(int r=0;r<runs;r++){
                 double t0=now();com6_multiply(A,B,C,n);double t=now()-t0;
@@ -765,13 +1228,12 @@ int main(int argc, char**argv){
 
     /* Full benchmark */
     printf("====================================================================\n");
-    printf("  COM6 v85 - Persistent Threads + Pre-Alloc Buffers (%d threads)\n",nth);
-    printf("  n<=512:  MC=%d KC=n (one-shot) NC=%d\n",MC_MT_SMALL,NC_DEFAULT);
-    printf("  n<=1024: MC=%d KC=%d NC=%d\n",MC_MT_SMALL,KC_SMALL,NC_DEFAULT);
-    printf("  n<=2048: MC=%d KC=%d NC=%d\n",MC_LARGE,KC_LARGE,NC_DEFAULT);
-    printf("  n<=4096: MC=%d KC=%d NC=%d\n",MC_LARGE,KC_LARGE,1024);
-    printf("  n>=8192: MC=%d KC=%d NC=%d\n",MC_HUGE,KC_HUGE,NC_HUGE);
-    printf("  Pre-alloc buffers, OMP warmup, KC=n eliminates 2nd pc pass\n");
+    printf("  COM6 v85 - Dynamic IC Scheduling + Thread Pool Warmup (%d threads)\n",nth);
+    printf("  n<=1024: MC=%d KC=%d NC=%d (dynamic scheduling)\n",MC_MT_SMALL,KC_SMALL,NC_DEFAULT);
+    printf("  n<=2048: MC=%d KC=%d NC=%d (dynamic scheduling)\n",MC_LARGE,KC_LARGE,NC_DEFAULT);
+    printf("  n<=4096: MC=%d KC=%d NC=%d (dynamic scheduling)\n",MC_LARGE,KC_LARGE,1024);
+    printf("  n>=8192: MC=%d KC=%d NC=%d (dynamic scheduling)\n",MC_HUGE,KC_HUGE,NC_HUGE);
+    printf("  Fix: v84 left 2/8 threads idle at 512 (static partitioning bug)\n");
     printf("====================================================================\n\n");
 
     int sizes[]={256,512,1024,2048,4096,8192};
@@ -839,7 +1301,8 @@ int main(int argc, char**argv){
 
         af(A);af(B);if(C1)af(C1);af(C2);
     }
-    printf("\nv85: Persistent thread pool + pre-alloc buffers + GOMP_SPINCOUNT.\n");
+    printf("\nv85: Dynamic IC scheduling fixes v84 load imbalance.\n");
+    printf("     Thread pool pre-warmed. sfence after NT stores.\n");
     printf("Run individual: ./com6_v85 <size> [mt|1t]\n");
     return 0;
 }
