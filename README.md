@@ -17,9 +17,26 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v99 - Latest)
+## COM6 Matrix Multiplication Results (v99 - Champion)
 
-### v99: v96 Dispatch + Targeted MC=48 for Large IC-Parallel (latest)
+### Very-Large-Size Scaling (v99)
+
+v99 scales cleanly past 8192 via Strassen recursion. Tested with 3-min cold-CPU cooldowns on the thermally-limited 15W i7-10510U:
+
+| Size | Time | GFLOPS | Notes |
+|------|------|--------|-------|
+| 8192 MT | 27.7s | **39.6 GF** | Strassen → 7× IC-parallel 4096 |
+| 10000 MT | 84.0s | 23.8 GF | Strassen → 7× IC-parallel 5000 |
+| 12000 MT | 97.6s | **35.4 GF** | Strassen → 7× IC-parallel 6000 |
+
+12000 outperforms 10000 on GFLOPS — likely because 6000-sized sub-muls hit the IC-parallel L2/L3 sweet spot better than 5000, and the longer total runtime lets thermal steady-state dominate over the thermal transient. Neither approaches cold-CPU peak (~90 GF); sustained 15W TDP is the bottleneck, not algorithmic.
+
+### Failed Experiments (kept for reference)
+
+- **v98 — Pure BLIS at 8192 (no Strassen)**: 23.6 GF. Lost to v99 Strassen by 38-68% on this hardware. Strassen's 7 shorter bursts thermally outperform one long 8192 BLIS sweep on 15W TDP. File: `com6_v98.c`.
+- **v101 — Parallel Strassen glue + pool alloc**: 37.4 GF cold, ~6% regression vs v99 39.6 GF. The OMP fork-join overhead for sub_copy/mat_add/mat_sub exceeded the savings from collapsing 23 mallocs into one pool. Strassen glue is already cheap (<5% of total at 8192); parallelizing it wasn't worth the barrier cost. File: `com6_v101.c`.
+
+### v99: v96 Dispatch + Targeted MC=48 for Large IC-Parallel
 
 v99 combines v96's cache-aware dispatch with a targeted blocking change for large IC-parallel:
 
