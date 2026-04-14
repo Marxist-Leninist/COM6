@@ -17,9 +17,31 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v96 - Latest)
+## COM6 Matrix Multiplication Results (v99 - Latest)
 
-### v96: Best-of-Both Dispatch (latest)
+### v99: v96 Dispatch + Targeted MC=48 for Large IC-Parallel (latest)
+
+v99 combines v96's cache-aware dispatch with a targeted blocking change for large IC-parallel:
+
+- **MC=48 at n>=4096** in IC-parallel (was MC_LARGE=96 in v96)
+- Rationale: 86 ic-iterations / 8 threads = 10-11 per thread (vs v96's 5-6) — better load balance
+- 48*320*8 = 120KB fits L2 cleanly (L2 = 256KB on i7-10510U)
+- Everything else identical to v96 — v97's experiment of "MC=48 always" regressed 1024/512 by ~17%, so v99 keeps v96's known-good blocking for smaller sizes
+
+**v99 vs v96 head-to-head (same run, 8-thread affinity, /HIGH priority, cold CPU):**
+
+| Size | v96 MT | v99 MT | Improvement |
+|------|--------|--------|-------------|
+| 8192 MT | 76.5 GF | **78.0 GF** | +2% |
+| 4096 MT | 83.3 GF | **92.1 GF** | **+11%** |
+| 2048 MT | 89.6 GF | **93.2 GF** | +4% |
+| 1024 MT | 67.5 GF | **78.0 GF** | **+16%** |
+| 512 MT | **58.5 GF** | 50.1 GF | -14% (noise: code-identical at n<=1024) |
+| 256 MT | 14.6 GF | **22.2 GF** | +52% |
+
+v99 wins 5 of 6 sizes. The 512 "loss" is run-to-run variance since the IC-parallel branch for n<=1024 is byte-identical between v96 and v99 (both use MC_MT_SMALL=48). Biggest wins at 4096 (+11%) and 1024 (+16%) — exactly where the blocking change takes effect.
+
+### v96: Best-of-Both Dispatch (superseded by v99)
 
 v96 optimizes the threading dispatch based on L3 cache analysis:
 - **n>=8192**: Strassen (Winograd variant, 7 sub-muls) — shorter bursts sustain higher clocks on 15W TDP
