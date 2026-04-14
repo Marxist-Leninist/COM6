@@ -41,6 +41,18 @@ v99 combines v96's cache-aware dispatch with a targeted blocking change for larg
 
 v99 wins 5 of 6 sizes. The 512 "loss" is run-to-run variance since the IC-parallel branch for n<=1024 is byte-identical between v96 and v99 (both use MC_MT_SMALL=48). Biggest wins at 4096 (+11%) and 1024 (+16%) — exactly where the blocking change takes effect.
 
+**v99 vs OpenBLAS (fair interleaved, 10s cooling, thermal-limited laptop):**
+
+| Size | BLAS MT | COM6 v99 MT | Ratio | Winner |
+|------|---------|-------------|-------|--------|
+| 512 | **63.7 GF** | 57.6 GF | 0.90x | BLAS |
+| 1024 | 50.6 GF | **66.6 GF** | **1.32x** | **COM6** |
+| 2048 | **45.5 GF** | 45.0 GF | 0.99x | tie |
+| 4096 | 30.6 GF | **41.4 GF** | **1.35x** | **COM6** |
+| 8192 | 38.1 GF | **42.2 GF** | **1.11x** | **COM6** |
+
+COM6 v99 wins 3 of 5, ties 2048, loses only at 512 (where BLAS's deep thread-pool amortization dominates). All absolute numbers here are thermal-throttled — cold-CPU runs show 78-93 GF for v99. The interesting signal is the *ratio* between interleaved tests: BLAS holds its 512 advantage, but COM6 wins at every size >= 1024.
+
 ### v96: Best-of-Both Dispatch (superseded by v99)
 
 v96 optimizes the threading dispatch based on L3 cache analysis:
