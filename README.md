@@ -35,6 +35,7 @@ v99 scales cleanly past 8192 via Strassen recursion. Tested with 3-min cold-CPU 
 
 - **v98 — Pure BLIS at 8192 (no Strassen)**: 23.6 GF. Lost to v99 Strassen by 38-68% on this hardware. Strassen's 7 shorter bursts thermally outperform one long 8192 BLIS sweep on 15W TDP. File: `com6_v98.c`.
 - **v101 — Parallel Strassen glue + pool alloc**: 37.4 GF cold, ~6% regression vs v99 39.6 GF. The OMP fork-join overhead for sub_copy/mat_add/mat_sub exceeded the savings from collapsing 23 mallocs into one pool. Strassen glue is already cheap (<5% of total at 8192); parallelizing it wasn't worth the barrier cost. File: `com6_v101.c`.
+- **Thread-count sweep at 8192** (cold-to-progressive-warm): 4T=35.1 GF, 6T=29.3 GF, 8T=26.9 GF. The decline tracks thermal state across runs (later runs get hotter CPU), not thread efficiency: cold-start 8T=39.6 GF (earlier test) beats cold-start 4T=35.1 GF. Avoiding HT contention doesn't help — the burst phase is where performance lives, and 8 threads maximize it.
 
 ### v99: v96 Dispatch + Targeted MC=48 for Large IC-Parallel
 
