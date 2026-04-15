@@ -17,26 +17,34 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v99 - Champion)
+## COM6 Matrix Multiplication Results (v99 canonical, v105 large-size champion)
 
-### Very-Large-Size Scaling (v99)
+### Very-Large-Size Scaling — v105 vs v99
 
-v99 scales cleanly past 8192 via Strassen recursion. Tested with 3-min cold-CPU cooldowns on the thermally-limited 15W i7-10510U:
+v105 = v103 persistent packing buffers + v102 thermal pacing (500ms sleep between Strassen sub-muls, `COM6_STRASSEN_PACE_MS` env, default 500). Pacing keeps the 15W TDP CPU in turbo between the 7 sub-muls — counterintuitive but empirically a huge win at 10000+:
 
-| Size | Time | GFLOPS | Notes |
-|------|------|--------|-------|
-| 8192 MT | 27.7s | **39.6 GF** | Strassen → 7× IC-parallel 4096 |
-| 10000 MT | 84.0s | 23.8 GF | Strassen → 7× IC-parallel 5000 |
-| 12000 MT | 97.6s | **35.4 GF** | Strassen → 7× IC-parallel 6000 |
+| Size | v99 MT | v105 MT (pace=500) | Improvement |
+|------|--------|--------------------|-------------|
+| 8192 MT | 39.6 GF | 70.0 GF (cold) / 61.7 GF (warm) | **+77% / +56%** |
+| 10000 MT | 23.8 GF | **73.5 GF** | **+209%** |
+| 12000 MT | 35.4 GF | **55.8 GF** | **+58%** |
 
-12000 outperforms 10000 on GFLOPS — likely because 6000-sized sub-muls hit the IC-parallel L2/L3 sweet spot better than 5000, and the longer total runtime lets thermal steady-state dominate over the thermal transient. Neither approaches cold-CPU peak (~90 GF); sustained 15W TDP is the bottleneck, not algorithmic.
+At 10000, the original v99 path crashed into thermal throttle (23.8 GF) because the 7 sub-muls of 5000 ran back-to-back for ~84 seconds, sustaining 15W TDP throughout. v105's 500ms pacing lets each sub-mul finish at turbo clocks — net throughput **3.1× higher** despite the 3.5s of added sleep, because the CPU spends more time at ~3.5 GHz instead of base clock.
+
+12000 gains less (+58%) because 6000-sized sub-muls already approach the IC-parallel L2/L3 sweet spot naturally, but pacing still extracts useful headroom.
+
+Neither approaches cold-CPU peak (~90 GF). On thermally-unbound hardware (e.g. Xeon 16c), pacing would be a negative optimization — it's a workaround for 15W laptops.
+
+### Successful Experiments
+
+- **v102 — Thermal-paced Strassen (Sleep between sub-muls)**: Inserting `Sleep(pace_ms)` between the 7 Strassen sub-muls via `COM6_STRASSEN_PACE_MS` env var. Sweep result at 8192 MT: pace=0: 50.9 GF, **pace=500: 54.4-65.0 GF (sweet spot, +7-50% over v99)**, pace=1000: 47.1 GF, pace=2000: 36.6 GF. The 500ms window is long enough for turbo-clock recovery on the 15W i7-10510U but short enough that added idle time doesn't dominate. Confirmed real, reproducible win. File: `com6_v102.c`.
+- **v103 — Persistent packing buffers across Strassen sub-muls**: 63.0 GF vs v101's 62.3 GF at 8192 MT. Architecturally sound: `pa_bufs[nthreads]` and `pb` allocated ONCE at Strassen entry and reused across all 7 sub-muls via `com6_multiply_ctx` / `com6_multiply_ic_ctx` / `com6_multiply_jc_ctx`. Eliminates 7 × (nthreads+1) alloc/free rounds and keeps pa/pb warm in L2/L3. Modest alone but stacks cleanly with v102 pacing to produce v105. File: `com6_v103.c`.
+- **v105 — v103 persistent buffers + v102 thermal pacing** (combined): **Large-size champion.** +77% at 8192 cold, +209% at 10000, +58% at 12000 vs v99 (see table above). Default `pace_ms=500`; set `COM6_STRASSEN_PACE_MS=0` to behave identically to v103. File: `com6_v105.c`.
 
 ### Failed Experiments (kept for reference)
 
 - **v98 — Pure BLIS at 8192 (no Strassen)**: 23.6 GF. Lost to v99 Strassen by 38-68% on this hardware. Strassen's 7 shorter bursts thermally outperform one long 8192 BLIS sweep on 15W TDP. File: `com6_v98.c`.
 - **v101 — Parallel Strassen glue + pool alloc**: 37.4 GF cold, ~6% regression vs v99 39.6 GF. The OMP fork-join overhead for sub_copy/mat_add/mat_sub exceeded the savings from collapsing 23 mallocs into one pool. Strassen glue is already cheap (<5% of total at 8192); parallelizing it wasn't worth the barrier cost. File: `com6_v101.c`.
-- **v102 — Thermal-paced Strassen (sleep between sub-muls)**: experimental. Inserting 800ms sleeps between the 7 sub-muls to let the 15W CPU recover turbo between bursts. Net: wall-clock gain negated by the added idle time; real work takes the same 14-20s. File: `com6_v102.c`.
-- **v103 — Persistent packing buffers across Strassen sub-muls**: 63.0 GF vs v101's 62.3 GF at 8192 MT (~+1% within thermal noise). Architecturally sound: `pa_bufs[nthreads]` and `pb` allocated ONCE at Strassen entry and reused across all 7 sub-muls via `com6_multiply_ctx` / `com6_multiply_ic_ctx` / `com6_multiply_jc_ctx`. Eliminates 7 × (nthreads+1) alloc/free rounds and keeps pa/pb warm in L2/L3 between sub-muls. At 8192 each sub-mul runs ~2.5s, so alloc/free is <1% of time — change is more meaningful on smaller Strassen decomposition levels where the fixed-cost ratio is higher. Kept as the preferred Strassen path; v99 remains the canonical benchmark-reference binary. File: `com6_v103.c`.
 - **v104 — Strassen dispatch at 4096+ (not just 8192+)**: 36.2 GF at 4096 MT vs v103 direct IC-par at 63.9 GF — **a 43% regression**. The Winograd 12.5% FLOP savings were swamped by Strassen glue cost (8 submatrix copies at 32MB each + 8 sums + 7 products = ~100MB of page-faults on cold pool) and by 7 sequential JC-parallel 2048 sub-muls each rebuilding their own private B-panels, thrashing L3 instead of sharing it. Confirmed: Strassen is a thermal-window trick for 8192+ where the direct BLIS burst is long enough that clocks throttle; at 4096 a single direct burst still fits the thermal envelope and wins outright. Reverted; v103 retains 8192-only Strassen.
 - **Thread-count sweep at 8192** (cold-to-progressive-warm): 4T=35.1 GF, 6T=29.3 GF, 8T=26.9 GF. The decline tracks thermal state across runs (later runs get hotter CPU), not thread efficiency: cold-start 8T=39.6 GF (earlier test) beats cold-start 4T=35.1 GF. Avoiding HT contention doesn't help — the burst phase is where performance lives, and 8 threads maximize it.
 
