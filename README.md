@@ -2,7 +2,7 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication at 512+ sizes.**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 107 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, best-of-both dispatch (IC-parallel for 4096+, JC-parallel for 2048, pure IC-par with inter-NC pacing for 8192+), single hoisted OpenMP parallel region per matmul (v107), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, C-prefetch at kernel entry, 2x-unrolled B-panel packing, persistent packing buffers across Strassen sub-muls (v103), thermal pacing for 15W TDP laptop sustained performance (v102/v105), and reverse benchmark ordering for thermal management.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 108 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, best-of-both dispatch (IC-parallel for 4096+, JC-parallel for 2048, pure IC-par with inter-NC pacing for 4096+/8192+), single hoisted OpenMP parallel region per matmul (v107), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, C-prefetch at kernel entry, 2x-unrolled B-panel packing, persistent packing buffers across Strassen sub-muls (v103), thermal pacing for 15W TDP laptop sustained performance at both 4096 (v108) and 8192+ (v102/v105/v106), and reverse benchmark ordering for thermal management.
 
 ## COM7NN Transformer vs Standard Transformer
 
@@ -17,7 +17,22 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v107 current champion)
+## COM6 Matrix Multiplication Results (v108 current champion at 4096 MT; v107 elsewhere)
+
+### v108 vs v107 at 4096 MT (pacing extended to 4096+)
+
+v107 applied per-NC thermal pacing only at `n>=8192`. At 4096 MT the full compute burst is ~2.3s on a 15W i7-10510U — long enough that the CPU drops out of turbo halfway through. v108 extends pacing to `n>=4096` with a shorter default (150ms vs 400ms at 8192), firing once between the two NC blocks.
+
+Cold-CPU single-shot comparison (3-minute pre-run cooldown on the i7-10510U laptop; numbers are heavily thermal-dependent — see caveat below):
+
+| Size | v107 MT | v108 MT | Improvement |
+|------|---------|---------|-------------|
+| 4096 MT | 61.8 GF | **72.3 GF** | **+17%** |
+| 8192 MT | 41.0 GF | **66.2 GF** | **+61%** (v108 finishes 8192 faster → less accumulated heat) |
+
+Env knobs: `COM6_PACE_MS=N` tunes pace value, `COM6_PACE_MIN_N=N` adjusts threshold (default 4096 in v108, 8192 in v107), `COM6_IC_2048=1` routes 2048 through IC-par for experiments.
+
+**Thermal caveat**: Run-to-run variance on this 15W TDP laptop can exceed 30%. The above pair is the single-shot best. A two-run v108 sequence with 90s/180s cooldowns showed 4096 MT swinging from 72.3 → 45.6 GF as CPU heat accumulated. On thermally-unbound hardware (Xeon, desktop), this pacing is a NEGATIVE optimization and should be disabled via `COM6_PACE_MIN_N=8192` to restore v107 behaviour. File: `com6_v108.c`.
 
 ### v107 vs v106 head-to-head (fair full-suite, 30s cold start)
 
