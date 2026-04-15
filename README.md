@@ -592,6 +592,29 @@ gcc -O3 -march=native -mavx2 -mfma -funroll-loops -o com6_v36 com6_v36.c -lm -lp
 ./com6_v36
 ```
 
+## Benchmarking (bench.sh)
+
+On 15W laptops, single-run comparisons lie — thermal noise at n≥4096 is ±30%
+run-to-run, which is larger than most tuning deltas. `bench.sh` is a
+thermally-aware harness that enforces fixed cooldowns and reports the
+distribution (min / median / max / mean / stddev / spread), so signal can be
+told from noise.
+
+```bash
+./bench.sh -e com6_v108.exe -n 4096 -m mt -r 5 -c 120
+# 5 runs of MT at 4096, 120s cooldown between runs
+# Output includes best, median, min, mean, stddev, and spread-% of mean
+```
+
+It also aborts if it detects any lingering `com6_v*.exe` processes (a real
+multi-session hazard — a rogue `com6_v31.exe` from an earlier test once sat
+burning 100% of a core for hours, invalidating every "cooldown" reading).
+Kill them first with `tasklist | grep -i com6` / `taskkill //PID <pid> //F`.
+
+To compare two versions, run `bench.sh` twice with `-l A` / `-l B` labels and
+compare the summary blocks — the median (not the best) is usually the honest
+number when spread exceeds ~10%.
+
 ## Test Platforms
 
 ### Primary: Intel Core i7-10510U (Comet Lake) Laptop
