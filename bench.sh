@@ -17,6 +17,8 @@
 #   -r RUNS       number of runs (default: 5)
 #   -c COOLDOWN   seconds to sleep between runs (default: 90)
 #   -l LABEL      label for this run (printed in summary)
+#   -w GATE       warmup GFLOPS gate (default: 40, 0 disables)
+#   -W TRIES      max warmup probes (default: 6)
 #
 # Aborts if any lingering com6_v*.exe processes are detected (per
 # feedback_com6_check_rogue_procs.md — rogue background compute
@@ -30,8 +32,10 @@ MODE="mt"
 RUNS=5
 COOLDOWN=90
 LABEL=""
+WARMUP_GATE=40      # 0 disables warmup
+WARMUP_TRIES=6
 
-while getopts "e:n:m:r:c:l:h" opt; do
+while getopts "e:n:m:r:c:l:w:W:h" opt; do
     case $opt in
         e) EXE="$OPTARG" ;;
         n) SIZE="$OPTARG" ;;
@@ -39,6 +43,8 @@ while getopts "e:n:m:r:c:l:h" opt; do
         r) RUNS="$OPTARG" ;;
         c) COOLDOWN="$OPTARG" ;;
         l) LABEL="$OPTARG" ;;
+        w) WARMUP_GATE="$OPTARG" ;;     # warmup GFLOPS gate (0 = disable)
+        W) WARMUP_TRIES="$OPTARG" ;;    # max warmup probes
         h) sed -n '2,22p' "$0"; exit 0 ;;
         *) echo "unknown opt"; exit 1 ;;
     esac
@@ -71,6 +77,15 @@ if [[ -n "$rogues" ]]; then
 fi
 
 LABEL="${LABEL:-$(basename "$EXE") n=$SIZE $MODE}"
+
+# Pre-bench warmup (skipped if -w 0)
+script_dir=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+warmup="$script_dir/warmup.sh"
+if (( WARMUP_GATE > 0 )) && [[ -x "$warmup" || -f "$warmup" ]]; then
+    echo "--- warmup (gate=$WARMUP_GATE GF, max=$WARMUP_TRIES tries) ---"
+    bash "$warmup" -e "$EXE" -n 512 -g "$WARMUP_GATE" -t "$WARMUP_TRIES" || \
+        echo "  (warmup couldn't reach gate — proceeding, numbers may be noisy)"
+fi
 
 echo "===================================================================="
 echo "  bench.sh | $LABEL"
