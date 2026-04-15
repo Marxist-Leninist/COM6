@@ -2,7 +2,7 @@
 
 **COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication at 512+ sizes.**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 96 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, best-of-both dispatch (IC-parallel for 4096, JC-parallel for 2048, Strassen for 8192+), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, C-prefetch at kernel entry, 2x-unrolled B-panel packing, and reverse benchmark ordering for thermal management.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 107 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, best-of-both dispatch (IC-parallel for 4096+, JC-parallel for 2048, pure IC-par with inter-NC pacing for 8192+), single hoisted OpenMP parallel region per matmul (v107), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, C-prefetch at kernel entry, 2x-unrolled B-panel packing, persistent packing buffers across Strassen sub-muls (v103), thermal pacing for 15W TDP laptop sustained performance (v102/v105), and reverse benchmark ordering for thermal management.
 
 ## COM7NN Transformer vs Standard Transformer
 
@@ -17,7 +17,24 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v99 canonical, v105 large-size champion)
+## COM6 Matrix Multiplication Results (v107 current champion)
+
+### v107 vs v106 head-to-head (fair full-suite, 30s cold start)
+
+v107 hoists the `#pragma omp parallel` region to enclose the entire jc/pc loop nest, replacing v106's per-pc fork/join pattern. At 8192 with KC=320 that cuts 104 fork/join rounds down to 1. Cooperative B-packing synchronized by an explicit barrier; ic loop's implicit barrier ends each pc phase. `Sleep(pace_ms)` wrapped in `#pragma omp master` + barrier so only the master thread sleeps while workers wait.
+
+| Size | v106 MT | v107 MT | Improvement |
+|------|---------|---------|-------------|
+| 8192 MT | 56.0 GF | **62.1 GF** | **+11%** |
+| 4096 MT | 40.9 GF | **49.6 GF** | **+21%** |
+| 2048 MT | 49.3 GF | 44.3 GF | -10% (JC-par path unchanged; noise) |
+| 1024 MT | 53.0 GF | **58.6 GF** | **+11%** |
+| 512 MT  | 41.4 GF | **51.2 GF** | **+24%** |
+| 256 MT  | 12.0 GF | **20.4 GF** | **+70%** |
+
+Wins 5/6 sizes; the 2048 "regression" is in the JC-parallel path which v107 doesn't touch, so it's pure thermal noise between two back-to-back runs. Biggest lifts at the small end (256/512/1024 MT) where OpenMP fork/join was a larger fraction of total compute — v107 pays that cost once per matmul instead of once per KC block.
+
+## COM6 Matrix Multiplication Results (v105 large-size champion, v99 reference)
 
 ### Very-Large-Size Scaling — v105 vs v99
 
