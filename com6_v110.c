@@ -1080,8 +1080,8 @@ int main(int argc, char**argv){
     }
 
     printf("====================================================================\n");
-    printf("  COM6 v108 - Pacing extended to 4096 MT (%d threads)\n",nth);
-    printf("  8192+: IC-par + 400ms pace | 4096: IC-par + 150ms pace (v108) | 2048: JC-par | <2048: IC-par\n");
+    printf("  COM6 v110 - MC=64 at 4096 MT (was 48) for zero ic-imbalance (%d threads)\n",nth);
+    printf("  8192+: IC-par + 400ms pace | 4096: IC-par MC=64 + 150ms pace | 2048: JC-par | <2048: IC-par\n");
     printf("  1T: MC=%d/%d KC=%d/%d | NC_JC=%d | NC=%d\n",
            MC_SMALL,MC_LARGE,KC_SMALL,KC_LARGE,NC_JC,NC);
     printf("  Reverse order: 8192 first (cold CPU)\n");
