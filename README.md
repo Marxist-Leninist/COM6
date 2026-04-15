@@ -19,6 +19,20 @@ Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting 
 
 ## COM6 Matrix Multiplication Results (v108 current champion at 4096 MT; v107 elsewhere)
 
+### v108 vs OpenBLAS — Fresh sweep, 2026-04-15 (5/5 sizes, i7-10510U 15W TDP)
+
+Best run each, size-adaptive cooldowns (20s/30s/60s/120s), OpenBLAS-first-then-COM6 ordering per size. `com6_vs_blas_v10.py` (+ `bench_8192.py` for the largest point):
+
+| Size | OpenBLAS (GF) | COM6 v108 (GF) | Ratio | Winner |
+|------|--------------:|---------------:|------:|:------:|
+| 512  | 57.7  | **95.9**  | **1.66x** | COM6 |
+| 1024 | 106.2 | **115.5** | **1.09x** | COM6 |
+| 2048 | 97.5  | **108.9** | **1.12x** | COM6 |
+| 4096 | 95.0  | **102.5** | **1.08x** | COM6 |
+| 8192 | 74.1  | **92.7**  | **1.25x** | COM6 |
+
+COM6 wins every size tested. Biggest gap at 512 (1.66x) where the kernel's 8x k-unroll + 6x8 outer-product + single hoisted OMP region outruns OpenBLAS's fork-join cost for a ~3ms matmul. The 8192 lead (1.25x) is Strassen-with-thermal-pacing (v105 path) extracting a real algorithmic + thermal win over OpenBLAS's direct BLIS burst on a 15W TDP laptop. Reproduce: `python com6_vs_blas_v10.py` and `python bench_8192.py`.
+
 ### v108 2048 MT: JC-par default confirmed over IC-par (bench.sh, 2026-04-15)
 
 v108 routes 2048 MT through the JC-parallel path with `COM6_IC_2048=1` reachable as an experiment knob. The historical justification was "IC-par wins cold, JC-par wins warm" — but no fair measurement had been done with `bench.sh` until now. Three-run bench.sh on the i7-10510U laptop:
@@ -94,6 +108,7 @@ Neither approaches cold-CPU peak (~90 GF). On thermally-unbound hardware (e.g. X
 
 - **v109 — Finer-grained pacing at 4096 (NC=1024, 3× 75ms fires)**: 57.1 GF vs v108's 73.5 GF at 4096 MT (-22%). Root cause: 75ms is below the PCU turbo-ramp floor on the i7-10510U — multiplier can't bump back to 3.6 GHz before new work arrives. 150ms clears the bar; 75ms doesn't. Also: 2× B-pack rounds per matmul and more per-NC barrier cost. v108's single 150ms fire is the sweet spot. File: `com6_v109.c`.
 - **v110 — MC sweep at 4096 MT**: tested MC ∈ {48, 60, 64, 72, 96} to break v108's 86-ic-iter / 8-thread imbalance. Thermal noise (±30% on this 15W TDP laptop) exceeded any MC-choice signal. MC=64 regressed 25% (MR=6 edge penalty); MC=72/96 showed bimodal cold-vs-warm results (78.2/32.2 GF at MC=96). Also tested `COM6_PACE_MS=0` vs 150ms: pacing wins by ~4% under matched cooldowns. MC=48 retained as default; COM6_MC_4096 env retained for thermally-unbound hardware testing (Xeon desktop). File: `com6_v110.c`.
+- **v111 — Per-size hybrid body (v98-style for 512/1024, hoisted for 2048+)**: claimed wins in header comment from an earlier-hardware test did NOT reproduce on this i7-10510U. Fresh head-to-head vs v108 on 2026-04-15: 512 MT 74.3 vs 93.0 GF (-20%), 1024 MT tied (~106 GF), 2048 MT 88.1 vs 113.9 GF (-23%). Root cause: v111's extra branch on every sub-mul plus a second allocation path adds overhead that the claimed benefits don't recoup on this CPU. v108 hoisted body + size-adaptive pacing wins outright. File: `com6_v111.c`.
 - **v98 — Pure BLIS at 8192 (no Strassen)**: 23.6 GF. Lost to v99 Strassen by 38-68% on this hardware. Strassen's 7 shorter bursts thermally outperform one long 8192 BLIS sweep on 15W TDP. File: `com6_v98.c`.
 - **v101 — Parallel Strassen glue + pool alloc**: 37.4 GF cold, ~6% regression vs v99 39.6 GF. The OMP fork-join overhead for sub_copy/mat_add/mat_sub exceeded the savings from collapsing 23 mallocs into one pool. Strassen glue is already cheap (<5% of total at 8192); parallelizing it wasn't worth the barrier cost. File: `com6_v101.c`.
 - **v104 — Strassen dispatch at 4096+ (not just 8192+)**: 36.2 GF at 4096 MT vs v103 direct IC-par at 63.9 GF — **a 43% regression**. The Winograd 12.5% FLOP savings were swamped by Strassen glue cost (8 submatrix copies at 32MB each + 8 sums + 7 products = ~100MB of page-faults on cold pool) and by 7 sequential JC-parallel 2048 sub-muls each rebuilding their own private B-panels, thrashing L3 instead of sharing it. Confirmed: Strassen is a thermal-window trick for 8192+ where the direct BLIS burst is long enough that clocks throttle; at 4096 a single direct burst still fits the thermal envelope and wins outright. Reverted; v103 retains 8192-only Strassen.
