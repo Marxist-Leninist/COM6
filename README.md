@@ -19,6 +19,23 @@ Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting 
 
 ## COM6 Matrix Multiplication Results (v108 current champion at 4096 MT; v107 elsewhere)
 
+### v108 2048 MT: JC-par default confirmed over IC-par (bench.sh, 2026-04-15)
+
+v108 routes 2048 MT through the JC-parallel path with `COM6_IC_2048=1` reachable as an experiment knob. The historical justification was "IC-par wins cold, JC-par wins warm" — but no fair measurement had been done with `bench.sh` until now. Three-run bench.sh on the i7-10510U laptop:
+
+| Config | Run 1 | Run 2 | Run 3 | Best | Spread |
+|--------|-------|-------|-------|------|--------|
+| JC-par (default) | 68.2 | 67.4 | 51.7 | **68.2 GF** | 26% |
+| IC-par (`COM6_IC_2048=1`) | 58.6 | 18.5 | 21.7 | 58.6 GF | 122% |
+
+JC-par holds 67-68 GF for the first two runs then drops to 51.7 as heat accumulates. IC-par starts at 58.6 (CPU moderately warm — tested right after JC-par with 45s cooldown) and then collapses to 18-22 GF on subsequent runs. IC-par's cooperative B-packing with explicit `#pragma omp barrier` between packing and compute phases has idle threads spin-waiting on the barrier; JC-par's fully-independent per-thread column ranges have no barriers. The empirical result is that JC-par is dramatically more thermally resilient at 2048 MT on a 15W TDP part. **Verdict: JC-par default for 2048 MT is correct; IC-par opt-in retained for desktop/workstation use where thermals aren't a constraint.**
+
+Reproduce:
+```
+./bench.sh -e com6_v108.exe -n 2048 -m mt -r 3 -c 45           # JC-par (default)
+COM6_IC_2048=1 ./bench.sh -e com6_v108.exe -n 2048 -m mt -r 3 -c 90   # IC-par
+```
+
 ### v108 vs v107 at 4096 MT (pacing extended to 4096+)
 
 v107 applied per-NC thermal pacing only at `n>=8192`. At 4096 MT the full compute burst is ~2.3s on a 15W i7-10510U — long enough that the CPU drops out of turbo halfway through. v108 extends pacing to `n>=4096` with a shorter default (150ms vs 400ms at 8192), firing once between the two NC blocks.
