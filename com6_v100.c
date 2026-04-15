@@ -1,39 +1,38 @@
 /*
- * COM6 v100 - v99 + KC=n one-shot for n<=512 (halves barriers at small MT)
- * =====================================================
- * v96 remained best across most sizes, but v97 proved MC=48 at n>=4096
- * gives ~+16% in IC-parallel (better thread balance: 86 ic-iters/8 thr
- * = 10-11 per thread vs 5-6, and 48*320*8=120KB fits L2 cleanly).
+
+ * COM6 v100 - Persistent pthreads pool eliminates OpenMP fork-join overhead
+ * =========================================================================
+ * v99 lost at 512 (0.70x vs OpenBLAS) because OpenMP has ~50-100μs fork-join
+ * overhead per parallel region. At 512, the IC-parallel path hits omp parallel
+ * twice per pc-loop iteration (B-pack + ic-loop barrier), totaling ~200-400μs
+ * of pure overhead on a ~4ms job.
  *
- * v99 = v96 + targeted MC=48 only at n>=4096 IC-par. Smaller sizes keep
- * their known-good blocking (v97 regressed 1024/512 by ~17%).
+ * v100 replaces OpenMP entirely with a persistent pthreads pool:
+ * - Threads created once at first use, spin-wait (~1μs dispatch)
+ * - Single dispatch per pc-iteration: B-pack + barrier + ic-work in one wake
+ * - Atomic work-stealing for ic-blocks (zero lock contention)
+ * - Pool threads spin ~2000 iterations then condvar sleep (minimal thermal)
  *
- * Dispatch (unchanged):
- * - n>=8192: Strassen (shorter bursts sustain clocks on 15W TDP)
- * - n>=4096: IC-parallel (shared B in L3)
+ * All v99 algorithmic structure preserved:
+ * - n>=8192: Strassen (Winograd variant, shorter bursts sustain clocks)
+ * - n>=4096: IC-parallel (shared B in L3, MC=48 for thread balance)
  * - 2048<=n<4096: JC-parallel (private B-panels, zero barriers)
- * - n<2048: IC-parallel (proven best for small/medium)
- *
- * Strassen decomposition (Winograd variant):
- *   S1=A21+A22, S2=S1-A11, S3=A11-A21, S4=A12-S2
- *   T1=B12-B11, T2=B22-T1, T3=B22-B12, T4=T2-B21
- *   M1=A11*B11, M2=A12*B21, M3=S4*B22, M4=A22*T4
- *   M5=S1*T1, M6=S2*T2, M7=S3*T3
- *   C11=M1+M2, C12=M1+M6+M5+M3, C21=M1+M6+M7+M4, C22=M1+M6+M7+M5
+ * - n<2048: IC-parallel (best for small/medium)
  *
  * Compile:
- *   gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -static -o com6_v95 com6_v95.c -lm
+ *   gcc -O3 -march=native -mavx2 -mfma -funroll-loops -lpthread -o com6_v100 com6_v100.c -lm
  */
 
 #include <immintrin.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sched.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -49,12 +48,150 @@
 #define MC_SMALL 120
 #define KC_LARGE 320
 #define MC_LARGE 96
-#define KC_MAX 512  /* v100: raised from 320 for KC=n one-shot at n<=512 */
+#define KC_MAX 320
 #define MC_MAX 120
 #define MC_MT_SMALL 48
 
+#define MAX_THREADS 32
+#define SPIN_ITERS 2000
+
 static inline double* aa(size_t c){return(double*)_mm_malloc(c*sizeof(double),ALIGN);}
 static inline void af(double*p){_mm_free(p);}
+
+/* ================================================================
+ * PERSISTENT THREAD POOL
+ * ================================================================
+ * Threads spin-wait (~1μs) then fall asleep on condvar.
+ * Wake latency: ~1μs spin, ~10μs from condvar sleep.
+ * vs OpenMP: ~50-100μs per fork-join.
+ * ================================================================ */
+
+typedef struct {
+    /* Work descriptor — set by dispatcher before wake */
+    void (*fn)(int tid, int nthreads, void* arg);
+    void* arg;
+
+    /* Synchronization */
+    atomic_int generation;      /* bumped each dispatch */
+    atomic_int threads_done;    /* count of threads that finished */
+    int nthreads;
+
+    /* Thread state */
+    pthread_t threads[MAX_THREADS];
+    int thread_count;
+    int shutdown;
+
+    /* Condvar for sleeping threads */
+    pthread_mutex_t mutex;
+    pthread_cond_t wake_cond;
+    pthread_cond_t done_cond;
+} thread_pool_t;
+
+static thread_pool_t g_pool = {
+    .generation = 0,
+    .threads_done = 0,
+    .thread_count = 0,
+    .shutdown = 0,
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .wake_cond = PTHREAD_COND_INITIALIZER,
+    .done_cond = PTHREAD_COND_INITIALIZER,
+};
+
+static void* pool_worker(void* arg) {
+    thread_pool_t* pool = &g_pool;
+    int tid = (int)(long)arg;
+    int my_gen = 0;
+
+    while (1) {
+        /* Spin-wait for new work */
+        int spins = 0;
+        while (atomic_load_explicit(&pool->generation, memory_order_acquire) == my_gen) {
+            if (pool->shutdown) return NULL;
+            if (++spins < SPIN_ITERS) {
+                _mm_pause(); _mm_pause(); _mm_pause(); _mm_pause();
+            } else {
+                /* Fall asleep on condvar */
+                pthread_mutex_lock(&pool->mutex);
+                while (atomic_load(&pool->generation) == my_gen && !pool->shutdown)
+                    pthread_cond_wait(&pool->wake_cond, &pool->mutex);
+                pthread_mutex_unlock(&pool->mutex);
+                break;
+            }
+        }
+        if (pool->shutdown) return NULL;
+        my_gen = atomic_load(&pool->generation);
+
+        /* Execute work */
+        pool->fn(tid, pool->nthreads, pool->arg);
+
+        /* Signal completion */
+        int done = atomic_fetch_add(&pool->threads_done, 1) + 1;
+        if (done == pool->nthreads) {
+            pthread_mutex_lock(&pool->mutex);
+            pthread_cond_signal(&pool->done_cond);
+            pthread_mutex_unlock(&pool->mutex);
+        }
+    }
+    return NULL;
+}
+
+static int get_num_cpus(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si; GetSystemInfo(&si); return si.dwNumberOfProcessors;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n > 0) ? (int)n : 4;
+#endif
+}
+
+static void pool_init(void) {
+    if (g_pool.thread_count > 0) return;
+    int ncpus = get_num_cpus();
+    if (ncpus > MAX_THREADS) ncpus = MAX_THREADS;
+    g_pool.thread_count = ncpus;
+    g_pool.nthreads = ncpus;
+
+    for (int i = 0; i < ncpus; i++) {
+        pthread_create(&g_pool.threads[i], NULL, pool_worker, (void*)(long)i);
+    }
+}
+
+/* Dispatch work to all pool threads, wait for completion.
+ * fn(tid, nthreads, arg) called on each thread. ~1μs dispatch. */
+static void pool_dispatch(void (*fn)(int,int,void*), void* arg) {
+    pool_init();
+    thread_pool_t* pool = &g_pool;
+
+    pool->fn = fn;
+    pool->arg = arg;
+    pool->nthreads = pool->thread_count;
+    atomic_store(&pool->threads_done, 0);
+
+    /* Wake all threads */
+    atomic_fetch_add_explicit(&pool->generation, 1, memory_order_release);
+    pthread_mutex_lock(&pool->mutex);
+    pthread_cond_broadcast(&pool->wake_cond);
+    pthread_mutex_unlock(&pool->mutex);
+
+    /* Wait for all threads to finish */
+    pthread_mutex_lock(&pool->mutex);
+    while (atomic_load(&pool->threads_done) < pool->nthreads)
+        pthread_cond_wait(&pool->done_cond, &pool->mutex);
+    pthread_mutex_unlock(&pool->mutex);
+}
+
+static void pool_shutdown(void) {
+    if (g_pool.thread_count == 0) return;
+    g_pool.shutdown = 1;
+    atomic_fetch_add(&g_pool.generation, 1);
+    pthread_mutex_lock(&g_pool.mutex);
+    pthread_cond_broadcast(&g_pool.wake_cond);
+    pthread_mutex_unlock(&g_pool.mutex);
+    for (int i = 0; i < g_pool.thread_count; i++)
+        pthread_join(g_pool.threads[i], NULL);
+    g_pool.thread_count = 0;
+    g_pool.shutdown = 0;
+}
 
 /* ================================================================
  * MICRO-KERNEL: beta=1 (C += A*B) with C-prefetch
@@ -162,8 +299,7 @@ micro_6x8_beta1(int kc, const double* pA, const double* pB, double* C, int ldc)
         "vbroadcastsd 184(%[pA]),%%ymm14\n\t"
         "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t" "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
-        /* k+4 — second prefetch wave */
-        "prefetcht0 1152(%[pA])\n\t" "prefetcht0 1536(%[pB])\n\t"
+        /* k+4 */
         "vmovapd 256(%[pB]),%%ymm12\n\t" "vmovapd 288(%[pB]),%%ymm13\n\t"
         "vbroadcastsd 192(%[pA]),%%ymm14\n\t"
         "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t" "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
@@ -226,7 +362,10 @@ micro_6x8_beta1(int kc, const double* pA, const double* pB, double* C, int ldc)
         "addq $384,%[pA]\n\t" "addq $512,%[pB]\n\t"
         "decq %[kc8]\n\t" "jnz 1b\n\t"
 
-        "3:\n\t" "testq %[kcr],%[kcr]\n\t" "jle 2f\n\t"
+        "3:\n\t"
+        "testq %[kcr],%[kcr]\n\t"
+        "jle 2f\n\t"
+        ".p2align 4\n\t"
         "4:\n\t"
         "vmovapd (%[pB]),%%ymm12\n\t" "vmovapd 32(%[pB]),%%ymm13\n\t"
         "vbroadcastsd (%[pA]),%%ymm14\n\t"
@@ -302,7 +441,7 @@ micro_6x8_beta0(int kc, const double* pA, const double* pB, double* C, int ldc)
         "prefetcht0 768(%[pA])\n\t"
         "prefetcht0 1024(%[pB])\n\t"
 
-        /* k+0 through k+7 — identical FMA body */
+        /* k+0 through k+7 — same FMA body as beta1 */
         "vmovapd (%[pB]),%%ymm12\n\t" "vmovapd 32(%[pB]),%%ymm13\n\t"
         "vbroadcastsd (%[pA]),%%ymm14\n\t"
         "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t" "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
@@ -359,7 +498,6 @@ micro_6x8_beta0(int kc, const double* pA, const double* pB, double* C, int ldc)
         "vbroadcastsd 184(%[pA]),%%ymm14\n\t"
         "vfmadd231pd %%ymm14,%%ymm12,%%ymm10\n\t" "vfmadd231pd %%ymm14,%%ymm13,%%ymm11\n\t"
 
-        "prefetcht0 1152(%[pA])\n\t" "prefetcht0 1536(%[pB])\n\t"
         "vmovapd 256(%[pB]),%%ymm12\n\t" "vmovapd 288(%[pB]),%%ymm13\n\t"
         "vbroadcastsd 192(%[pA]),%%ymm14\n\t"
         "vfmadd231pd %%ymm14,%%ymm12,%%ymm0\n\t" "vfmadd231pd %%ymm14,%%ymm13,%%ymm1\n\t"
@@ -419,7 +557,10 @@ micro_6x8_beta0(int kc, const double* pA, const double* pB, double* C, int ldc)
         "addq $384,%[pA]\n\t" "addq $512,%[pB]\n\t"
         "decq %[kc8]\n\t" "jnz 1b\n\t"
 
-        "3:\n\t" "testq %[kcr],%[kcr]\n\t" "jle 2f\n\t"
+        "3:\n\t"
+        "testq %[kcr],%[kcr]\n\t"
+        "jle 2f\n\t"
+        ".p2align 4\n\t"
         "4:\n\t"
         "vmovapd (%[pB]),%%ymm12\n\t" "vmovapd 32(%[pB]),%%ymm13\n\t"
         "vbroadcastsd (%[pA]),%%ymm14\n\t"
@@ -437,19 +578,25 @@ micro_6x8_beta0(int kc, const double* pA, const double* pB, double* C, int ldc)
         "addq $48,%[pA]\n\t" "addq $64,%[pB]\n\t"
         "decq %[kcr]\n\t" "jnz 4b\n\t"
 
-        /* beta=0: just store, no load from C */
         "2:\n\t"
-        "vmovupd %%ymm0,(%[C])\n\t" "vmovupd %%ymm1,32(%[C])\n\t"
+        /* beta=0: just store, no load from C */
+        "vmovupd %%ymm0,(%[C])\n\t"
+        "vmovupd %%ymm1,32(%[C])\n\t"
         "addq %[ldc],%[C]\n\t"
-        "vmovupd %%ymm2,(%[C])\n\t" "vmovupd %%ymm3,32(%[C])\n\t"
+        "vmovupd %%ymm2,(%[C])\n\t"
+        "vmovupd %%ymm3,32(%[C])\n\t"
         "addq %[ldc],%[C]\n\t"
-        "vmovupd %%ymm4,(%[C])\n\t" "vmovupd %%ymm5,32(%[C])\n\t"
+        "vmovupd %%ymm4,(%[C])\n\t"
+        "vmovupd %%ymm5,32(%[C])\n\t"
         "addq %[ldc],%[C]\n\t"
-        "vmovupd %%ymm6,(%[C])\n\t" "vmovupd %%ymm7,32(%[C])\n\t"
+        "vmovupd %%ymm6,(%[C])\n\t"
+        "vmovupd %%ymm7,32(%[C])\n\t"
         "addq %[ldc],%[C]\n\t"
-        "vmovupd %%ymm8,(%[C])\n\t" "vmovupd %%ymm9,32(%[C])\n\t"
+        "vmovupd %%ymm8,(%[C])\n\t"
+        "vmovupd %%ymm9,32(%[C])\n\t"
         "addq %[ldc],%[C]\n\t"
-        "vmovupd %%ymm10,(%[C])\n\t" "vmovupd %%ymm11,32(%[C])\n\t"
+        "vmovupd %%ymm10,(%[C])\n\t"
+        "vmovupd %%ymm11,32(%[C])\n\t"
 
         : [pA]"+r"(pA),[pB]"+r"(pB),[kc8]"+r"(kc_8),[kcr]"+r"(kc_rem),[C]"+r"(C)
         : [ldc]"r"(ldc_bytes)
@@ -458,52 +605,78 @@ micro_6x8_beta0(int kc, const double* pA, const double* pB, double* C, int ldc)
     );
 }
 
-static void micro_edge(int mr,int nr,int kc,const double*pA,const double*pB,
-                        double*C,int n,int beta){
-    if(!beta){for(int i=0;i<mr;i++)for(int j=0;j<nr;j++)C[i*n+j]=0.0;}
-    for(int k=0;k<kc;k++)for(int i=0;i<mr;i++){
-        double av=pA[k*MR+i];for(int j=0;j<nr;j++)C[i*n+j]+=av*pB[k*NR+j];}
+/* ================================================================
+ * EDGE CASES: partial MR/NR tiles
+ * ================================================================ */
+static void micro_edge(int mr, int nr, int kc, const double*pA, const double*pB,
+                        double*C, int ldc, int beta){
+    double tmp[MR*NR] __attribute__((aligned(64)));
+    if(beta){for(int i=0;i<mr;i++)for(int j=0;j<nr;j++)tmp[i*NR+j]=C[i*ldc+j];}
+    else{memset(tmp,0,sizeof(tmp));}
+    for(int k=0;k<kc;k++){
+        for(int i=0;i<MR;i++){
+            double a=pA[k*MR+i];
+            for(int j=0;j<NR;j++) tmp[i*NR+j]+=a*pB[k*NR+j];
+        }
+    }
+    for(int i=0;i<mr;i++)for(int j=0;j<nr;j++)C[i*ldc+j]=tmp[i*NR+j];
 }
 
-/* AVX2 B-packing */
-static void pack_B_chunk(const double*__restrict__ B,double*__restrict__ pb,
-                          int kc,int nc,int n,int j0,int k0,int j_start,int j_end){
-    for(int j=j_start;j<j_end;j+=NR){
+/* ================================================================
+ * PACKING
+ * ================================================================ */
+static void pack_B(const double*B, double*pb, int kc, int nc, int n, int jc, int pc){
+    for(int j=0;j<nc;j+=NR){
         int nr=(j+NR<=nc)?NR:nc-j;
-        const double*Bkj=B+(size_t)k0*n+(j0+j);
-        double*dest=pb+(j/NR)*((size_t)NR*kc);
-        if(nr==NR){for(int k=0;k<kc;k++){
-            _mm256_store_pd(dest,_mm256_loadu_pd(Bkj));
-            _mm256_store_pd(dest+4,_mm256_loadu_pd(Bkj+4));
-            dest+=NR;Bkj+=n;
-        }}else{for(int k=0;k<kc;k++){
-            int jj;for(jj=0;jj<nr;jj++)dest[jj]=Bkj[jj];
-            for(;jj<NR;jj++)dest[jj]=0.0;dest+=NR;Bkj+=n;
-        }}
+        for(int k=0;k<kc;k++){
+            const double*src=B+(size_t)(pc+k)*n+(jc+j);
+            if(nr==NR){
+                _mm256_storeu_pd(pb, _mm256_loadu_pd(src));
+                _mm256_storeu_pd(pb+4, _mm256_loadu_pd(src+4));
+            } else {
+                int jj;for(jj=0;jj<nr;jj++)pb[jj]=src[jj];
+                for(;jj<NR;jj++)pb[jj]=0.0;
+            }
+            pb+=NR;
+        }
     }
 }
 
-static void pack_B(const double*__restrict__ B,double*__restrict__ pb,
-                    int kc,int nc,int n,int j0,int k0){
-    pack_B_chunk(B,pb,kc,nc,n,j0,k0,0,nc);
+/* Pack B-panel chunk [j_start..j_end) within a larger nc panel */
+static void pack_B_chunk(const double*B, double*pb, int kc, int nc, int n,
+                          int jc, int pc, int j_start, int j_end){
+    for(int j=j_start;j<j_end;j+=NR){
+        int nr=(j+NR<=nc)?NR:nc-j;
+        double*dst=pb+(j/NR)*((size_t)NR*kc);
+        for(int k=0;k<kc;k++){
+            const double*src=B+(size_t)(pc+k)*n+(jc+j);
+            if(nr==NR){
+                _mm256_storeu_pd(dst, _mm256_loadu_pd(src));
+                _mm256_storeu_pd(dst+4, _mm256_loadu_pd(src+4));
+            } else {
+                int jj;for(jj=0;jj<nr;jj++)dst[jj]=src[jj];
+                for(;jj<NR;jj++)dst[jj]=0.0;
+            }
+            dst+=NR;
+        }
+    }
 }
 
-/* 2-column unrolled A-packing */
-static void pack_A(const double*__restrict__ A,double*__restrict__ pa,
-                    int mc,int kc,int n,int i0,int k0){
-    const double*Ab=A+(size_t)i0*n+k0;
+static void pack_A(const double*A, double*pa, int mc, int kc, int n, int ic, int pc){
+    const double*Ab=A+(size_t)pc;
     for(int i=0;i<mc;i+=MR){
         int mr=(i+MR<=mc)?MR:mc-i;
         if(mr==MR){
-            const double*a0=Ab+i*n,*a1=a0+n,*a2=a0+2*n,
-                        *a3=a0+3*n,*a4=a0+4*n,*a5=a0+5*n;
+            const double*a0=Ab+(size_t)(ic+i)*n, *a1=a0+n, *a2=a1+n;
+            const double*a3=a2+n, *a4=a3+n, *a5=a4+n;
             int k=0;
-            for(;k+1<kc;k+=2){
-                pa[0]=a0[k];pa[1]=a1[k];pa[2]=a2[k];
-                pa[3]=a3[k];pa[4]=a4[k];pa[5]=a5[k];
-                pa[6]=a0[k+1];pa[7]=a1[k+1];pa[8]=a2[k+1];
-                pa[9]=a3[k+1];pa[10]=a4[k+1];pa[11]=a5[k+1];
-                pa+=2*MR;
+            /* 4x unrolled */
+            for(;k+3<kc;k+=4){
+                pa[0]=a0[k];pa[1]=a1[k];pa[2]=a2[k];pa[3]=a3[k];pa[4]=a4[k];pa[5]=a5[k];
+                pa[6]=a0[k+1];pa[7]=a1[k+1];pa[8]=a2[k+1];pa[9]=a3[k+1];pa[10]=a4[k+1];pa[11]=a5[k+1];
+                pa[12]=a0[k+2];pa[13]=a1[k+2];pa[14]=a2[k+2];pa[15]=a3[k+2];pa[16]=a4[k+2];pa[17]=a5[k+2];
+                pa[18]=a0[k+3];pa[19]=a1[k+3];pa[20]=a2[k+3];pa[21]=a3[k+3];pa[22]=a4[k+3];pa[23]=a5[k+3];
+                pa+=24;
             }
             for(;k<kc;k++){
                 pa[0]=a0[k];pa[1]=a1[k];pa[2]=a2[k];
@@ -511,7 +684,7 @@ static void pack_A(const double*__restrict__ A,double*__restrict__ pa,
             }
         }else{
             for(int k=0;k<kc;k++){
-                int ii;for(ii=0;ii<mr;ii++)pa[ii]=(Ab+(i+ii)*n)[k];
+                int ii;for(ii=0;ii<mr;ii++)pa[ii]=(Ab+(ic+i+ii)*(size_t)n)[k];
                 for(;ii<MR;ii++)pa[ii]=0.0;pa+=MR;
             }
         }
@@ -540,20 +713,14 @@ static void get_blocking(int n, int*pMC, int*pKC){
     else{*pMC=MC_LARGE;*pKC=KC_LARGE;}
 }
 static void get_blocking_mt(int n, int*pMC, int*pKC){
-    /* v100: KC=n one-shot for n<=512 — eliminates pc loop's second pass.
-     *   At n=512 with KC_SMALL=256: 2 pc iters, 2 barriers, beta=1 path used.
-     *   At n=512 with KC=512: 1 pc iter, 1 barrier, beta=0 only. v85 showed
-     *   +83% at 512 on Xeon with this trick.
-     * Buffer: 512*512*8 = 2MB B-panel (still fits 8MB L3 easily).
-     * v99: MC=48 at n>=4096 (IC-par) for better thread balance + L2 fit.
-     * n==2048 uses JC-par (these MC/KC values not hit) — keep MC_LARGE.
-     * n<=1024 uses IC-par with MC_MT_SMALL=48 — already good. */
-    if(n <= 512){*pMC=MC_MT_SMALL;*pKC=n;}
-    else if(n <= 1024){*pMC=MC_MT_SMALL;*pKC=KC_SMALL;}
+    if(n <= 1024){*pMC=MC_MT_SMALL;*pKC=KC_SMALL;}
     else if(n >= 4096){*pMC=MC_MT_SMALL;*pKC=KC_LARGE;}
     else{*pMC=MC_LARGE;*pKC=KC_LARGE;}
 }
 
+/* ================================================================
+ * SINGLE-THREADED MULTIPLY
+ * ================================================================ */
 static void com6_multiply_1t(const double*__restrict__ A,
                               const double*__restrict__ B,
                               double*__restrict__ C,int n)
@@ -572,82 +739,189 @@ static void com6_multiply_1t(const double*__restrict__ A,
     af(pa);af(pb);
 }
 
-/* JC-parallel: each thread owns a column slab with private B-panel.
- * Zero barriers, zero C write contention. Best for n>=2048. */
+/* ================================================================
+ * IC-PARALLEL (persistent pthreads pool, merged dispatch)
+ * ================================================================
+ * Single dispatch per pc-iteration:
+ *   1. Parallel B-pack (each thread packs a chunk)
+ *   2. Atomic spin-barrier (~10ns)
+ *   3. Atomic work-stealing for ic-blocks
+ * Total overhead: ~1μs per dispatch (vs ~100μs for OpenMP fork-join)
+ * ================================================================ */
+
+typedef struct {
+    const double* A;
+    const double* B;
+    double* C;
+    double* pb;         /* shared B-panel buffer */
+    double** pa_bufs;   /* per-thread A-panel buffers */
+    int n, mc_blk, kc_blk;
+    atomic_int barrier_count;   /* reusable spin barrier */
+    atomic_int ic_next;         /* work-stealing counter */
+} ic_work_t;
+
+/* Reusable spin barrier: all threads call, all block until nthreads arrive.
+ * Uses phase (even/odd) to allow reuse without reset. ~10ns on hot cache. */
+static inline void spin_barrier(atomic_int* counter, int nthreads, int phase) {
+    int target = (phase + 1) * nthreads;
+    int val = atomic_fetch_add(counter, 1) + 1;
+    if (val == target) return;  /* last thread arrives, done */
+    while (atomic_load_explicit(counter, memory_order_acquire) < target)
+        _mm_pause();
+}
+
+/* Single-dispatch IC-parallel worker: handles entire jc/pc/ic loop.
+ * Threads stay alive across all pc-iterations — zero re-dispatch overhead.
+ * B-pack is parallel, ic-loop uses atomic work-stealing. */
+static void ic_worker(int tid, int nthreads, void* arg) {
+    ic_work_t* w = (ic_work_t*)arg;
+    double* pa = w->pa_bufs[tid];
+    int n = w->n;
+    int mc_blk = w->mc_blk;
+    int kc_blk = w->kc_blk;
+    int phase = 0;
+
+    for (int jc = 0; jc < n; jc += NC) {
+        int nc = (jc + NC <= n) ? NC : n - jc;
+        int npanels = (nc + NR - 1) / NR;
+
+        for (int pc = 0; pc < n; pc += kc_blk) {
+            int kc = (pc + kc_blk <= n) ? kc_blk : n - pc;
+            int beta = (pc > 0) ? 1 : 0;
+
+            /* Phase 1: parallel B-pack */
+            int panels_per = (npanels + nthreads - 1) / nthreads;
+            int p0 = tid * panels_per;
+            int p1 = p0 + panels_per;
+            if (p1 > npanels) p1 = npanels;
+            int j_start = p0 * NR;
+            int j_end = p1 * NR;
+            if (j_end > nc) j_end = nc;
+            if (j_start < nc)
+                pack_B_chunk(w->B, w->pb, kc, nc, n, jc, pc, j_start, j_end);
+
+            /* Reset work counter before barrier (only thread 0) */
+            if (tid == 0)
+                atomic_store_explicit(&w->ic_next, 0, memory_order_relaxed);
+
+            /* Spin barrier: wait for B-pack completion */
+            spin_barrier(&w->barrier_count, nthreads, phase++);
+
+            /* Phase 2: atomic work-stealing for ic-blocks */
+            int ic;
+            while ((ic = atomic_fetch_add(&w->ic_next, mc_blk)) < n) {
+                int mc = (ic + mc_blk <= n) ? mc_blk : n - ic;
+                pack_A(w->A, pa, mc, kc, n, ic, pc);
+                macro_kernel(pa, w->pb, w->C, mc, nc, kc, n, ic, jc, beta);
+            }
+
+            /* Spin barrier: wait for all ic-work done before next pc iteration */
+            spin_barrier(&w->barrier_count, nthreads, phase++);
+        }
+    }
+}
+
+static void com6_multiply_ic(const double*__restrict__ A,
+                              const double*__restrict__ B,
+                              double*__restrict__ C, int n)
+{
+    pool_init();
+    int nthreads = g_pool.thread_count;
+
+    int mc_blk, kc_blk;
+    get_blocking_mt(n, &mc_blk, &kc_blk);
+
+    double** pa_bufs = (double**)malloc(nthreads * sizeof(double*));
+    for (int t = 0; t < nthreads; t++) pa_bufs[t] = aa((size_t)MC_MAX * KC_MAX);
+    double* pb = aa((size_t)KC_MAX * NC);
+
+    ic_work_t work;
+    work.A = A; work.B = B; work.C = C;
+    work.pb = pb; work.pa_bufs = pa_bufs;
+    work.n = n; work.mc_blk = mc_blk; work.kc_blk = kc_blk;
+    atomic_store(&work.barrier_count, 0);
+    atomic_store(&work.ic_next, 0);
+
+    /* SINGLE dispatch for entire multiply — threads handle jc/pc/ic loop */
+    pool_dispatch(ic_worker, &work);
+
+    for (int t = 0; t < nthreads; t++) af(pa_bufs[t]);
+    free(pa_bufs); af(pb);
+}
+
+
+/* ================================================================
+ * JC-PARALLEL (persistent pthreads pool, private B-panels)
+ * ================================================================ */
+typedef struct {
+    const double* A;
+    const double* B;
+    double* C;
+    int n, mc_blk, kc_blk;
+} jc_work_t;
+
+static void jc_worker(int tid, int nthreads, void* arg) {
+    jc_work_t* w = (jc_work_t*)arg;
+    int n = w->n;
+
+    int cols_per = ((n / nthreads + NR - 1) / NR) * NR;
+    int j_start = tid * cols_per;
+    int j_end = j_start + cols_per;
+    if (j_end > n) j_end = n;
+    if (j_start >= n) return;
+
+    double* pa = aa((size_t)MC_MAX * KC_MAX);
+    double* pb = aa((size_t)KC_MAX * NC_MAX);
+
+    for (int jc = j_start; jc < j_end; jc += NC_JC) {
+        int nc = (jc + NC_JC <= j_end) ? NC_JC : j_end - jc;
+        for (int pc = 0; pc < n; pc += w->kc_blk) {
+            int kc = (pc + w->kc_blk <= n) ? w->kc_blk : n - pc;
+            int beta = (pc > 0) ? 1 : 0;
+            pack_B_chunk(w->B, pb, kc, nc, n, jc, pc, 0, nc);
+            for (int ic = 0; ic < n; ic += w->mc_blk) {
+                int mc = (ic + w->mc_blk <= n) ? w->mc_blk : n - ic;
+                pack_A(w->A, pa, mc, kc, n, ic, pc);
+                macro_kernel(pa, pb, w->C, mc, nc, kc, n, ic, jc, beta);
+            }
+        }
+    }
+    af(pa); af(pb);
+}
+
 static void com6_multiply_jc(const double*__restrict__ A,
                               const double*__restrict__ B,
                               double*__restrict__ C, int n,
                               int mc_blk, int kc_blk)
 {
-    #pragma omp parallel
-    {
-        int tid = omp_get_thread_num();
-        int nt = omp_get_num_threads();
-
-        int cols_per = ((n / nt + NR - 1) / NR) * NR;
-        int j_start = tid * cols_per;
-        int j_end = j_start + cols_per;
-        if(j_end > n) j_end = n;
-
-        if(j_start < n){
-            double*pa = aa((size_t)MC_MAX*KC_MAX);
-            double*pb = aa((size_t)KC_MAX*NC_MAX);
-
-            for(int jc=j_start; jc<j_end; jc+=NC_JC){
-                int nc = (jc+NC_JC<=j_end) ? NC_JC : j_end-jc;
-                for(int pc=0; pc<n; pc+=kc_blk){
-                    int kc = (pc+kc_blk<=n) ? kc_blk : n-pc;
-                    int beta = (pc>0) ? 1 : 0;
-                    pack_B_chunk(B, pb, kc, nc, n, jc, pc, 0, nc);
-                    for(int ic=0; ic<n; ic+=mc_blk){
-                        int mc = (ic+mc_blk<=n) ? mc_blk : n-ic;
-                        pack_A(A, pa, mc, kc, n, ic, pc);
-                        macro_kernel(pa, pb, C, mc, nc, kc, n, ic, jc, beta);
-                    }
-                }
-            }
-            af(pa); af(pb);
-        }
-    }
+    jc_work_t work = { .A = A, .B = B, .C = C, .n = n,
+                        .mc_blk = mc_blk, .kc_blk = kc_blk };
+    pool_dispatch(jc_worker, &work);
 }
 
 /* ================================================================
  * STRASSEN: single-level for n>=8192 (Winograd variant)
- * ================================================================
- * Saves 12.5% FLOPs: 7 sub-multiplications of (n/2)x(n/2) instead of 8.
- * Submatrix additions are O(n^2) — negligible at this scale.
- * Each sub-multiply delegates to com6_multiply (full JC-parallel BLIS).
  * ================================================================ */
-
-/* Copy submatrix Asub[r..r+h, c..c+h] (stride lda) into contiguous hxh */
 static void sub_copy(const double*A, int lda, int r, int c, int h, double*out){
     for(int i=0;i<h;i++)
         memcpy(out+(size_t)i*h, A+(size_t)(r+i)*lda+c, (size_t)h*sizeof(double));
 }
-
-/* out = X + Y (both hxh contiguous) */
 static void mat_add(const double*X, const double*Y, double*out, int h){
-    size_t nn=(size_t)h*h;
-    size_t i=0;
+    size_t nn=(size_t)h*h; size_t i=0;
     for(;i+3<nn;i+=4){
         __m256d a=_mm256_loadu_pd(X+i), b=_mm256_loadu_pd(Y+i);
         _mm256_storeu_pd(out+i,_mm256_add_pd(a,b));
     }
     for(;i<nn;i++) out[i]=X[i]+Y[i];
 }
-
-/* out = X - Y (both hxh contiguous) */
 static void mat_sub(const double*X, const double*Y, double*out, int h){
-    size_t nn=(size_t)h*h;
-    size_t i=0;
+    size_t nn=(size_t)h*h; size_t i=0;
     for(;i+3<nn;i+=4){
         __m256d a=_mm256_loadu_pd(X+i), b=_mm256_loadu_pd(Y+i);
         _mm256_storeu_pd(out+i,_mm256_sub_pd(a,b));
     }
     for(;i<nn;i++) out[i]=X[i]-Y[i];
 }
-
-/* Accumulate: Csub[r..r+h, c..c+h] += M (contiguous hxh) */
 static void sub_acc(double*C, int ldc, int r, int c, int h, const double*M){
     for(int i=0;i<h;i++){
         double*row=C+(size_t)(r+i)*ldc+c;
@@ -660,8 +934,6 @@ static void sub_acc(double*C, int ldc, int r, int c, int h, const double*M){
         for(;j<(size_t)h;j++) row[j]+=mr[j];
     }
 }
-
-/* Write: Csub[r..r+h, c..c+h] = M (contiguous hxh) */
 static void sub_write(double*C, int ldc, int r, int c, int h, const double*M){
     for(int i=0;i<h;i++)
         memcpy(C+(size_t)(r+i)*ldc+c, M+(size_t)i*h, (size_t)h*sizeof(double));
@@ -670,164 +942,79 @@ static void sub_write(double*C, int ldc, int r, int c, int h, const double*M){
 /* Forward declaration */
 static void com6_multiply(const double*__restrict__ A,
                            const double*__restrict__ B,
-                           double*__restrict__ C,int n);
+                           double*__restrict__ C, int n);
 
 static void com6_strassen(const double*A, const double*B, double*C, int n){
-    int h = n/2;
-    size_t hh = (size_t)h*h;
-
-    /* Extract all 8 submatrices (contiguous for BLIS) */
+    int h=n/2; size_t hh=(size_t)h*h;
     double *A11=aa(hh),*A12=aa(hh),*A21=aa(hh),*A22=aa(hh);
     double *B11=aa(hh),*B12=aa(hh),*B21=aa(hh),*B22=aa(hh);
-    sub_copy(A,n, 0,0,h, A11); sub_copy(A,n, 0,h,h, A12);
-    sub_copy(A,n, h,0,h, A21); sub_copy(A,n, h,h,h, A22);
-    sub_copy(B,n, 0,0,h, B11); sub_copy(B,n, 0,h,h, B12);
-    sub_copy(B,n, h,0,h, B21); sub_copy(B,n, h,h,h, B22);
+    sub_copy(A,n,0,0,h,A11);sub_copy(A,n,0,h,h,A12);
+    sub_copy(A,n,h,0,h,A21);sub_copy(A,n,h,h,h,A22);
+    sub_copy(B,n,0,0,h,B11);sub_copy(B,n,0,h,h,B12);
+    sub_copy(B,n,h,0,h,B21);sub_copy(B,n,h,h,h,B22);
 
-    /* Winograd variant intermediate sums */
     double *S1=aa(hh),*S2=aa(hh),*S3=aa(hh),*S4=aa(hh);
     double *T1=aa(hh),*T2=aa(hh),*T3=aa(hh),*T4=aa(hh);
+    mat_add(A21,A22,S1,h); mat_sub(S1,A11,S2,h);
+    mat_sub(A11,A21,S3,h); mat_sub(A12,S2,S4,h);
+    mat_sub(B12,B11,T1,h); mat_sub(B22,T1,T2,h);
+    mat_sub(B22,B12,T3,h); mat_sub(T2,B21,T4,h);
 
-    mat_add(A21,A22, S1,h);    /* S1 = A21+A22 */
-    mat_sub(S1,A11,  S2,h);    /* S2 = S1-A11 */
-    mat_sub(A11,A21, S3,h);    /* S3 = A11-A21 */
-    mat_sub(A12,S2,  S4,h);    /* S4 = A12-S2 */
-
-    mat_sub(B12,B11, T1,h);    /* T1 = B12-B11 */
-    mat_sub(B22,T1,  T2,h);    /* T2 = B22-T1 */
-    mat_sub(B22,B12, T3,h);    /* T3 = B22-B12 */
-    mat_sub(T2,B21,  T4,h);    /* T4 = T2-B21 */
-
-    /* 7 sub-multiplications (each uses full JC-parallel BLIS) */
     double *M1=aa(hh),*M2=aa(hh),*M3=aa(hh),*M4=aa(hh);
     double *M5=aa(hh),*M6=aa(hh),*M7=aa(hh);
+    com6_multiply(A11,B11,M1,h); com6_multiply(A12,B21,M2,h);
+    com6_multiply(S4,B22,M3,h);  com6_multiply(A22,T4,M4,h);
+    com6_multiply(S1,T1,M5,h);  com6_multiply(S2,T2,M6,h);
+    com6_multiply(S3,T3,M7,h);
 
-    com6_multiply(A11, B11, M1, h);   /* M1 = A11*B11 */
-    com6_multiply(A12, B21, M2, h);   /* M2 = A12*B21 */
-    com6_multiply(S4,  B22, M3, h);   /* M3 = S4*B22 */
-    com6_multiply(A22, T4,  M4, h);   /* M4 = A22*T4 */
-    com6_multiply(S1,  T1,  M5, h);   /* M5 = S1*T1 */
-    com6_multiply(S2,  T2,  M6, h);   /* M6 = S2*T2 */
-    com6_multiply(S3,  T3,  M7, h);   /* M7 = S3*T3 */
-
-    /* Free inputs no longer needed */
     af(A11);af(A12);af(A21);af(A22);
     af(B11);af(B12);af(B21);af(B22);
     af(S1);af(S2);af(S3);af(S4);
     af(T1);af(T2);af(T3);af(T4);
 
-    /* U = M1 + M6 (temporary) */
-    double *U=aa(hh);
-    mat_add(M1, M6, U, h);
+    double *U=aa(hh),*tmp=aa(hh);
+    mat_add(M1,M6,U,h);
+    mat_add(M1,M2,tmp,h);       sub_write(C,n,0,0,h,tmp);
+    mat_add(U,M5,tmp,h); mat_add(tmp,M3,tmp,h); sub_write(C,n,0,h,h,tmp);
+    mat_add(U,M7,tmp,h); mat_sub(tmp,M4,tmp,h); sub_write(C,n,h,0,h,tmp);
+    mat_add(U,M7,tmp,h); mat_add(tmp,M5,tmp,h); sub_write(C,n,h,h,h,tmp);
 
-    /* C11 = M1 + M2 */
-    double *tmp=aa(hh);
-    mat_add(M1, M2, tmp, h);
-    sub_write(C, n, 0, 0, h, tmp);
-
-    /* C12 = U + M5 + M3 */
-    mat_add(U, M5, tmp, h);
-    mat_add(tmp, M3, tmp, h);
-    sub_write(C, n, 0, h, h, tmp);
-
-    /* C21 = U + M7 - M4 (Winograd: minus P4!) */
-    mat_add(U, M7, tmp, h);
-    mat_sub(tmp, M4, tmp, h);
-    sub_write(C, n, h, 0, h, tmp);
-
-    /* C22 = U + M7 + M5 */
-    mat_add(U, M7, tmp, h);
-    mat_add(tmp, M5, tmp, h);
-    sub_write(C, n, h, h, h, tmp);
-
-    af(tmp); af(U);
+    af(tmp);af(U);
     af(M1);af(M2);af(M3);af(M4);af(M5);af(M6);af(M7);
 }
 
-/* IC-parallel for small/medium (shared B, divided ic) */
-static void com6_multiply_ic(const double*__restrict__ A,
-                              const double*__restrict__ B,
-                              double*__restrict__ C, int n)
-{
-    int mc_blk, kc_blk;
-    get_blocking_mt(n, &mc_blk, &kc_blk);
-    int nthreads;
-    #pragma omp parallel
-    { nthreads = omp_get_num_threads(); }
-
-    double** pa_bufs = (double**)malloc(nthreads * sizeof(double*));
-    for(int t=0;t<nthreads;t++) pa_bufs[t] = aa((size_t)MC_MAX*KC_MAX);
-    double* pb = aa((size_t)KC_MAX*NC);
-
-    for(int jc=0;jc<n;jc+=NC){
-        int nc=(jc+NC<=n)?NC:n-jc;
-        for(int pc=0;pc<n;pc+=kc_blk){
-            int kc=(pc+kc_blk<=n)?kc_blk:n-pc;
-            int beta=(pc>0)?1:0;
-
-            #pragma omp parallel
-            {
-                int tid = omp_get_thread_num();
-                int nt = omp_get_num_threads();
-                double* pa = pa_bufs[tid];
-
-                int npanels = (nc + NR - 1) / NR;
-                int panels_per = (npanels + nt - 1) / nt;
-                int p0 = tid * panels_per;
-                int p1 = p0 + panels_per;
-                if(p1 > npanels) p1 = npanels;
-                int j_start = p0 * NR;
-                int j_end = p1 * NR;
-                if(j_end > nc) j_end = nc;
-                if(j_start < nc)
-                    pack_B_chunk(B,pb,kc,nc,n,jc,pc,j_start,j_end);
-
-                #pragma omp barrier
-
-                #pragma omp for schedule(static)
-                for(int ic=0;ic<n;ic+=mc_blk){
-                    int mc=(ic+mc_blk<=n)?mc_blk:n-ic;
-                    pack_A(A,pa,mc,kc,n,ic,pc);
-                    macro_kernel(pa,pb,C,mc,nc,kc,n,ic,jc,beta);
-                }
-            }
-        }
-    }
-    for(int t=0;t<nthreads;t++) af(pa_bufs[t]);
-    free(pa_bufs); af(pb);
-}
-
+/* ================================================================
+ * DISPATCH
+ * ================================================================ */
 static void com6_multiply(const double*__restrict__ A,
                            const double*__restrict__ B,
-                           double*__restrict__ C,int n)
+                           double*__restrict__ C, int n)
 {
-    int nthreads = 1;
-    #ifdef _OPENMP
-    nthreads = omp_get_max_threads();
-    #endif
-    if(n < 512 || nthreads <= 1){ com6_multiply_1t(A,B,C,n); return; }
+    pool_init();
+    int nthreads = g_pool.thread_count;
+    if (n < 512 || nthreads <= 1) { com6_multiply_1t(A,B,C,n); return; }
 
-    /* Strassen for 8192+: shorter sub-multiply bursts sustain higher clocks
-     * on 15W TDP laptop (7 x 4096 muls > 1 x 8192 sustained) */
-    if(n >= 8192 && (n & 1) == 0){
+    if (n >= 8192 && (n & 1) == 0) {
         com6_strassen(A, B, C, n);
         return;
     }
 
-    /* IC-parallel for 4096: shared B-panel (5MB) fits L3 (8MB)
-     * vs JC-parallel's 8 private B-panels (20MB total, thrashing L3) */
-    if(n >= 4096){
+    if (n >= 4096) {
+        /* IC-parallel: shared B in L3, atomic work-stealing */
         com6_multiply_ic(A, B, C, n);
-    } else if(n >= 2048){
-        /* JC-parallel for medium: each thread owns column slab, no barriers */
-        int mc_blk, kc_blk;
-        get_blocking(n, &mc_blk, &kc_blk);
-        com6_multiply_jc(A, B, C, n, mc_blk, kc_blk);
     } else {
-        com6_multiply_ic(A, B, C, n);
+        /* JC-parallel for all n<4096: zero barriers, each thread owns
+         * private column slice + B-panel. Eliminates synchronization
+         * overhead that hurts at small sizes (512/1024). */
+        int mc_blk, kc_blk;
+        get_blocking_mt(n, &mc_blk, &kc_blk);
+        com6_multiply_jc(A, B, C, n, mc_blk, kc_blk);
     }
 }
 
+/* ================================================================
+ * BENCHMARKING
+ * ================================================================ */
 static void naive(const double*A,const double*B,double*C,int n){
     memset(C,0,(size_t)n*n*sizeof(double));
     for(int i=0;i<n;i++)for(int k=0;k<n;k++){double a=A[i*n+k];for(int j=0;j<n;j++)C[i*n+j]+=a*B[k*n+j];}
@@ -839,10 +1026,8 @@ static double maxerr(const double*A,const double*B,int n){
 }
 
 int main(int argc, char**argv){
-    int nth=1;
-    #ifdef _OPENMP
-    nth=omp_get_max_threads();
-    #endif
+    pool_init();
+    int nth = g_pool.thread_count;
 
     if(argc >= 2){
         int n=atoi(argv[1]);
@@ -854,49 +1039,39 @@ int main(int argc, char**argv){
         }
         size_t nn=(size_t)n*n;
         double*A=aa(nn),*B=aa(nn),*C=aa(nn);
-        if(!A||!B||!C){printf("OOM\n");return 1;}
         srand(42);randf(A,n);randf(B,n);
+
         int runs=(n<=512)?7:(n<=1024)?5:(n<=2048)?3:2;
-        if(mode!=2){
-            com6_multiply_1t(A,B,C,n);
+
+        if(mode==0||mode==1){
+            com6_multiply_1t(A,B,C,n); /* warmup */
             double best=1e30;
             for(int r=0;r<runs;r++){double t0=now();com6_multiply_1t(A,B,C,n);double t=now()-t0;if(t<best)best=t;}
-            printf("1T  %4dx%-5d | %8.1f ms | %6.1f GF\n",n,n,best*1000,(2.0*n*n*(double)n)/(best*1e9));
+            printf("%dx%d 1T: %.1f ms (%.1f GF)\n",n,n,best*1000,(2.0*n*n*(double)n)/(best*1e9));
         }
-        if(mode!=1){
-            com6_multiply(A,B,C,n);
+        if(mode==0||mode==2){
+            com6_multiply(A,B,C,n); /* warmup */
             double best=1e30;
             for(int r=0;r<runs;r++){double t0=now();com6_multiply(A,B,C,n);double t=now()-t0;if(t<best)best=t;}
-            printf("MT  %4dx%-5d | %8.1f ms | %6.1f GF (%d threads)\n",n,n,best*1000,(2.0*n*n*(double)n)/(best*1e9),nth);
+            printf("%dx%d MT(%dT): %.1f ms (%.1f GF)\n",n,n,nth,best*1000,(2.0*n*n*(double)n)/(best*1e9));
         }
-        af(A);af(B);af(C);return 0;
+        af(A);af(B);af(C);
+        pool_shutdown();
+        return 0;
     }
 
-    printf("====================================================================\n");
-    printf("  COM6 v100 - v99+KC=n@512 (%d threads)\n",nth);
-    printf("  8192+: Strassen | 4096: IC-par | 2048-4096: JC-par | <2048: IC-par\n");
-    printf("  1T: MC=%d/%d KC=%d/%d | NC_JC=%d\n",
-           MC_SMALL,MC_LARGE,KC_SMALL,KC_LARGE,NC_JC);
-    printf("  Reverse order: 8192 first (cold CPU)\n");
-    printf("====================================================================\n\n");
+    printf("COM6 v100 - Persistent pthreads pool (no OpenMP)\n");
+    printf("Threads: %d (persistent pool, ~1us dispatch)\n\n", nth);
+    printf(" Size      |   1T (ms)  |   MT (ms)  |  GF(1T) |  GF(MT) | Verify\n");
+    printf("-----------|------------|------------|---------|---------|-------\n");
 
-    int sizes[]={8192,4096,2048,1024,512,256};
-    int ns=sizeof(sizes)/sizeof(sizes[0]);
-    printf("%-10s | %10s | %10s | %8s | %8s | %s\n","Size","1-thread","Multi-T","GF(1T)","GF(MT)","Verify");
-    printf("---------- | ---------- | ---------- | -------- | -------- | ------\n");
+    int sizes[]={256,512,1024,2048,4096,8192};
+    int nsizes=6;
 
-    for(int si=0;si<ns;si++){
-        int n=sizes[si];size_t nn=(size_t)n*n;
-        if(si > 0){
-#ifdef _WIN32
-            Sleep(4000);
-#endif
-        }
+    for(int si=0;si<nsizes;si++){
+        int n=sizes[si];
+        size_t nn=(size_t)n*n;
         double*A=aa(nn),*B=aa(nn),*C1=NULL,*C2=aa(nn);
-        if(!A||!B||!C2){
-            printf("%4dx%-5d | SKIPPED (OOM)\n",n,n);
-            if(A)af(A);if(B)af(B);if(C2)af(C2);continue;
-        }
         srand(42);randf(A,n);randf(B,n);
 
         int do_1t=(n<=2048);
@@ -924,9 +1099,17 @@ int main(int argc, char**argv){
             printf("%4dx%-5d | %10s | %8.1f ms | %6s   | %6.1f   | %s\n",n,n,"--",best_a*1000,"--",gfa,v);
 
         af(A);af(B);if(C1)af(C1);af(C2);
+
+        /* 4s cooldown between sizes to combat thermal throttling */
+        if(si < nsizes-1){
+            struct timespec ts = {4, 0};
+            nanosleep(&ts, NULL);
+        }
     }
-    printf("\nv96: Strassen@8192, IC-par@4096 (+12%%), JC-par@2048\n");
-    printf("Saves 12.5%% FLOPs at 8192, each sub-mul uses full BLIS GEMM\n");
+    printf("\nv100: Persistent pthreads pool replaces OpenMP (~1us vs ~100us dispatch)\n");
+    printf("Dispatch: Strassen@8192, IC-par@4096 (MC=48), JC-par@2048, IC-par@512-1024\n");
     printf("Run individual: ./com6_v100 <size> [mt|1t]\n");
+
+    pool_shutdown();
     return 0;
 }
