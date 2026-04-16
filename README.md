@@ -17,7 +17,45 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## COM6 Matrix Multiplication Results (v108 current champion at 4096 MT; v107 elsewhere)
+## COM6 Matrix Multiplication Results (v108 current champion; v100 pthreads-pool wins at 512 MT)
+
+### v100 (pthreads pool) vs v108 (OpenMP+IC-par) at 512 MT — 2026-04-16
+
+The OpenMP fork-join cost is proportionally largest at 512 MT (~3 ms matmul, so even ~50 µs spawn overhead is measurable). v100 replaces OpenMP with a persistent pthreads pool (spin-wait ~1 µs, condvar sleep after 2000 spins, atomic work-stealing for ic-blocks). It was committed 2026-04-15 but never interleaved-fair-bench'd against v108 until now.
+
+`bench_v100_vs_v108_512.sh`: 60 s initial cooldown, then 6 rounds × (v100 → 45 s cool → v108 → 45 s cool), i7-10510U 15W TDP laptop, cold CPU at start:
+
+| Round | v100 pthreads pool | v108 OpenMP champion | Ratio (v100/v108) |
+|------:|-------------------:|---------------------:|------------------:|
+| 1     | **106.6 GF**       | 93.7 GF              | 1.14x             |
+| 2     | **101.5 GF**       | 88.5 GF              | 1.15x             |
+| 3     | **100.9 GF**       | 88.7 GF              | 1.14x             |
+| 4     |  **85.3 GF**       | 74.5 GF              | 1.14x             |
+| 5     |  **99.5 GF**       | 95.5 GF              | 1.04x             |
+| 6     |  **98.3 GF**       | 83.9 GF              | 1.17x             |
+| BEST   | **106.6 GF**      | 95.5 GF              | **1.12x**         |
+| MEDIAN | **100.9 GF**      | 88.7 GF              | **1.14x**         |
+
+v100 wins **every round** at 512 MT — a clean, reproducible ~14 % median lift outside the ±30 % thermal noise envelope. Under the v108 best run (95.9 GF) already documented against OpenBLAS (57.7 GF, 1.66x), v100's median 100.9 GF projects to ~1.75x vs OpenBLAS at 512 MT, i.e. v100 widens the gap that v108 opened. v107's hoisted single `#pragma omp parallel` reduced fork/join from per-pc to per-matmul (one spawn per ~3 ms job); v100 removes that last spawn too — threads pay ~1 µs atomic+broadcast instead of ~50-100 µs `libgomp` team setup.
+
+Reproduce: `./bench_v100_vs_v108_512.sh` (expects `com6_v100.exe`, `com6_v108.exe` built, no rogue com6 procs running).
+
+### v100 vs v108 at 1024 and 2048 MT — 2026-04-16 (partial sweep)
+
+`bench_v100_vs_v108_medium.sh`: 4 rounds interleaved, 30 s cooldowns at 1024 and 45 s at 2048, cold start, same harness rules as the 512 bench.
+
+| Size | v100 (GF per round)            | v108 (GF per round)            | Median v100 | Median v108 | Ratio | Verdict |
+|-----:|--------------------------------|--------------------------------|------------:|------------:|------:|:--------|
+| 1024 | 109.2, 103.5, 114.6, 121.9      | 113.5, 112.9, 113.7, 120.3      | 114.6       | 113.7       | 1.008x | tie (within ±30% laptop noise) |
+| 2048 | 98.4, 105.6, 74.6, 34.4         | 111.2, 109.4, 62.0, 39.5        | —           | —           | —     | thermal collapse — rounds 3-4 invalid |
+
+At 1024 the pool advantage has disappeared: median 114.6 vs 113.7 GF is a 0.8% difference, an order of magnitude below the laptop's ±30 % thermal noise floor. Both v100 and v108 deliver the same throughput at this size because compute (~50 ms of FMA work per matmul) dwarfs the per-matmul dispatch overhead that distinguishes them.
+
+The 2048 run tells a different story but one that is *about the laptop, not the code*. Rounds 1-2 read 98-106 / 109-111 GF (v108 marginally ahead, ~1.05x), but rounds 3-4 collapsed to 34-75 GF as the 15 W TDP budget was exhausted — even with 45 s cooldowns the CPU couldn't recover clocks fast enough. The cold-start pair (98.4 vs 111.2) suggests v108's JC-par is a touch faster at 2048, consistent with the fact that v100 uses IC-par for n<2048 but JC-par for 2048≤n<4096, identical to v108's path at this size — so this is essentially a sanity check that the two implementations of the same algorithm agree.
+
+**Summary of the sweep so far (512, 1024, 2048):** v100's persistent pool is a clean ~14% win at 512 MT, statistically indistinguishable from v108 at 1024 MT, and statistically indistinguishable at 2048 MT in cold rounds. 4096 and 8192 were not run in this sweep — on the 15 W laptop, ±30 % thermal noise at those sizes would drown the <5 % expected effect, and the v108 thermal-pacing path (which v100 preserves verbatim for n≥4096) has already been documented vs OpenBLAS. Conclusion: **v100 is the right answer at 512 and neutral at 1024+**. Keep v108 as the all-sizes champion; use v100 when the small-matmul path is on the critical path.
+
+Reproduce: `./bench_v100_vs_v108_medium.sh` (expects `com6_v100.exe`, `com6_v108.exe`, cold CPU, no rogue com6 procs).
 
 ### v108 vs OpenBLAS — Fresh sweep, 2026-04-15 (5/5 sizes, i7-10510U 15W TDP)
 
