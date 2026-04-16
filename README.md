@@ -1,8 +1,28 @@
 # COM6 - Custom Operation Matrix Multiplication
 
-**COM6 beats OpenBLAS (NumPy/SciPy's backend) at matrix multiplication at 512+ sizes.**
+**COM6 beats OpenBLAS at matrix multiplication on both laptop (i7-10510U) and server (EPYC 7282).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 116 versions of iterative optimization (v108 is the current champion; v109-v116 are documented failed / inconclusive experiments), it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, best-of-both dispatch (IC-parallel for 4096+, JC-parallel for 2048, pure IC-par with inter-NC pacing for 4096+/8192+), single hoisted OpenMP parallel region per matmul (v107), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, C-prefetch at kernel entry, 2x-unrolled B-panel packing, persistent packing buffers across Strassen sub-muls (v103), thermal pacing for 15W TDP laptop sustained performance at both 4096 (v108) and 8192+ (v102/v105/v106), and reverse benchmark ordering for thermal management. Fresh 2026-04-15 head-to-head vs OpenBLAS shows 5/5 wins from 512 to 8192 (1.08x–1.66x).
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 118 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch (v118), persistent pthreads pool with spin-wait (~1us dispatch), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, L2-auto-tuned MC, physical-core-only threading, C-prefetch at kernel entry, and sched_setaffinity pinning on chiplet CPUs.
+
+**v118 on EPYC 7282 (16-core/32-thread, Zen 2)** — 2.7x over OpenBLAS at 8192, 342 GF peak at 1024:
+
+| Size | COM6 v118 16T (GF) | OpenBLAS 16T (GF) | Ratio | Winner |
+|------|-----------------:|-----------------:|------:|:------:|
+| 512 | **201.8** | 32.4 | **6.2x** | COM6 |
+| 1024 | **341.9** | 21.2 | **16.1x** | COM6 |
+| 2048 | **179.4** | 79.7 | **2.3x** | COM6 |
+| 4096 | **206.1** | 77.5 | **2.7x** | COM6 |
+| 8192 | **204.2** | 75.3 | **2.7x** | COM6 |
+
+**v108 on i7-10510U (4-core/8-thread, 15W TDP laptop)** — 5/5 sizes 1.08x–1.66x over OpenBLAS:
+
+| Size | COM6 v108 (GF) | OpenBLAS (GF) | Ratio |
+|------|---------------:|--------------:|------:|
+| 512 | **95.9** | 57.7 | **1.66x** |
+| 1024 | **115.5** | 106.2 | **1.09x** |
+| 2048 | **108.9** | 97.5 | **1.12x** |
+| 4096 | **102.5** | 95.0 | **1.08x** |
+| 8192 | **92.7** | 74.1 | **1.25x** |
 
 ## COM7NN Transformer vs Standard Transformer
 
@@ -16,6 +36,37 @@ The COM framework extends beyond matrix multiplication into neural network archi
 | Inference accuracy | 4/10 | **6/10** | COM7NN |
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
+
+## v118: Chiplet-Aware NUMA Dispatch (2026-04-17)
+
+v117 used IC-parallel at n>=4096 (all threads share a single packed B panel). This works well on monolithic die CPUs (i7-10510U) where all cores share one L3 cache. On chiplet CPUs like EPYC 7282 (4 CCDs, each with its own 16MB L3), cross-CCD traffic for the shared B panel destroyed performance: **47.8 GF at 8192 with 32 threads**.
+
+v118 auto-detects chiplet topology (multiple L3 groups in `/sys/devices/system/cpu/`) and switches to JC-parallel at all sizes. Each thread owns a private B panel that stays in its CCD's local L3, eliminating cross-die traffic. Result: **204.2 GF at 8192 with 16 threads — a 4.3x improvement.**
+
+### v118 vs v117 on EPYC 7282
+
+| Size | v117 IC-par (GF) | v118 JC-par (GF) | Speedup |
+|------|----------------:|-----------------:|--------:|
+| 512 | 201.1 | 201.8 | ~same |
+| 1024 | 286.7 | **341.9** | 1.19x |
+| 2048 | 151.1 | **179.4** | 1.19x |
+| 4096 | 29.9 | **206.1** | **6.9x** |
+| 8192 | 47.8 | **204.2** | **4.3x** |
+
+### Key insights
+
+1. **Per-core efficiency**: 4 threads on 1 CCD achieved 42.8 GF/core — 95.5% of the EPYC 7282's theoretical FP64 peak (44.8 GF/core at 2.8 GHz with 2 FMA units)
+2. **HyperThreading hurts**: 32 threads (16C+16HT) = 147 GF; 16 threads (physical only) = 209 GF. HT siblings compete for FMA ports in FMA-bound code
+3. **L2 auto-tuning**: EPYC's 512KB L2 allows MC=180 (vs MC=96 on i7's 256KB L2), reducing A-packing overhead by 88%
+4. **Thread pinning**: `sched_setaffinity` pins each pool thread to a physical core, preventing OS scheduler migration
+
+### Env controls
+
+- `COM6_THREADS=N` — override thread count (default: physical core count on chiplet, all logical on monolithic)
+- `COM6_FORCE_JC=1` — force JC-parallel at all sizes (useful for testing on monolithic CPUs)
+- `COM6_FORCE_IC=1` — force IC-parallel at n>=4096 (v117 behavior)
+
+On monolithic-die CPUs (Windows/i7), v118 automatically falls back to v117's dispatch (IC-par at 4096+). No regression on laptop.
 
 ## COM6 Matrix Multiplication Results (v108 current champion; v100 pthreads-pool wins at 512 MT)
 
