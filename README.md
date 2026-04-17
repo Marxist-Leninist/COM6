@@ -37,6 +37,31 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
+## v125: JC-Parallel All Sizes on Server (2026-04-17)
+
+v124 used IC-parallel for n < 2048 on monolithic servers, but testing revealed JC-parallel wins at 1024 (+18%) and 512 (+5%) on Xeon 16C. With 16 threads, JC-parallel's zero-barrier independent column strips beat IC-parallel's shared B-panel approach even at small sizes. v125 extends JC-parallel to ALL sizes on servers (L2 >= 512KB), using `get_blocking_mt` (small MC=48 for good IC granularity within each thread's column strip).
+
+### v125 full suite on Xeon Skylake 16C
+
+| Size | GF(1T) | GF(MT) | Verify |
+|------|-------:|-------:|:------:|
+| 8192 | -- | 217.7 | OK |
+| 4096 | 22.7 | 204.9 | OK |
+| 2048 | 23.8 | 198.3 | OK |
+| 1024 | 27.2 | **199.3** | OK |
+| 512 | 23.0 | 140.2 | OK |
+| 256 | 28.2 | 27.6 | OK |
+
+### v125 vs v124 at 1024 MT (back-to-back interleaved on Xeon)
+
+| Round | v124 (GF) | v125 (GF) |
+|------:|----------:|----------:|
+| 1 | 171.7 | 173.0 |
+| 2 | 143.6 | **193.6** |
+| 3 | 149.5 | **190.6** |
+
+v125 wins 1024 MT consistently: best 193.6 vs 171.7 GF (+13%). Laptop path unchanged (same dispatch for L2 < 512KB).
+
 ## v124: SIMD Edge Kernel + Server-Aware Blocking (2026-04-17)
 
 v124 adds two improvements over v123's core:
@@ -695,6 +720,7 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 
 | Version | Key Change | Peak GF |
 |---------|------------|---------|
+| **v125** | **JC-parallel all sizes on server — +18% at 1024, 199 GF on Xeon** | **217.7** (Xeon 8192) |
 | **v124** | **SIMD edge kernel + server-aware JC-parallel — +30% at 4096 on Xeon** | **222.6** (Xeon 8192) |
 | **v123** | **Adaptive Strassen depth + L2-auto KC tuning** | **213.9** (Xeon 8192) |
 | **v122** | **Memory-efficient Strassen (3-buffer, 384MB vs 3.2GB)** | **46.2** (laptop 8192) |
@@ -767,12 +793,12 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v124: AVX2 + OpenMP + SIMD edge kernel + server-aware blocking (recommended, latest)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v124 com6_v124.c -lm
-./com6_v124           # full benchmark (8192-256, reverse order)
-./com6_v124 4096 mt   # single-size MT cold CPU test
-./com6_v124 512 1t    # single-size 1T test
-./com6_v124 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
+# v125: AVX2 + OpenMP + JC-par all sizes on server (recommended, latest)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v125 com6_v125.c -lm
+./com6_v125           # full benchmark (8192-256, reverse order)
+./com6_v125 4096 mt   # single-size MT cold CPU test
+./com6_v125 512 1t    # single-size 1T test
+./com6_v125 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
 
 # v38: AVX2 + OpenMP
 gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v38 com6_v38.c -lm
