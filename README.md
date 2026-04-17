@@ -45,12 +45,15 @@ v124 used IC-parallel for n < 2048 on monolithic servers, but testing revealed J
 
 | Size | GF(1T) | GF(MT) | Verify |
 |------|-------:|-------:|:------:|
+| 16384 | -- | **236.8** | OK |
 | 8192 | -- | 217.7 | OK |
 | 4096 | 22.7 | 204.9 | OK |
 | 2048 | 23.8 | 198.3 | OK |
 | 1024 | 27.2 | **199.3** | OK |
 | 512 | 23.0 | 140.2 | OK |
 | 256 | 28.2 | 27.6 | OK |
+
+**Peak: 236.8 GFLOPS** at 16384 MT (1-level Strassen, 7 sub-problems of 8192). 2-level Strassen tested: 232.4 GF (slightly worse — 1-level remains the sweet spot).
 
 ### v125 vs v124 at 1024 MT (back-to-back interleaved on Xeon)
 
