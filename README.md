@@ -2,7 +2,7 @@
 
 **COM6 beats OpenBLAS at matrix multiplication on both laptop (i7-10510U) and server (EPYC 7282).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 120 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch, OpenMP IC/JC-parallel with OMP_PROC_BIND pinning, separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, L2-auto-tuned MC, physical-core-only threading, 4x k-unrolled A-packing, 2x k-unrolled B-packing, and C-prefetch at kernel entry.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 122 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch, OpenMP IC/JC-parallel with OMP_PROC_BIND pinning, separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, L2-auto-tuned MC, physical-core-only threading, 4x k-unrolled A-packing, 2x k-unrolled B-packing, C-prefetch at kernel entry, and memory-efficient Strassen for large sizes (3-buffer, 384MB at 8192 vs 3.2GB naive).
 
 **v120 on EPYC 7282 (16-core/32-thread, Zen 2)** — 411 GF peak at 1024, 203 GF at 8192:
 
@@ -72,6 +72,34 @@ v119 attempted to replace OpenMP with a custom pthreads pool (spin barriers + at
 - `COM6_USE_STRASSEN=1` — enable Strassen at 8192+ (opt-in, BLIS usually wins)
 - `COM6_PACE_MS=N` — thermal pacing between NC blocks (laptop 4096+)
 - `OMP_PROC_BIND=close OMP_PLACES=cores` — recommended for chiplet CPUs
+
+## v122: Memory-Efficient Strassen for 8192+ (2026-04-17)
+
+v121's Strassen crashed at 8192 (OOM: 25 temp buffers × 128MB = 3.2GB). v122 rewrites Strassen to use only 3 temp buffers (T1, T2, M) = 384MB, operating on strided quadrant views with OpenMP-parallelized add/sub. Also disables thermal pacing inside Strassen sub-problems (the FLOP reduction already handles cooling).
+
+### v122 vs v121 at 8192 MT (i7-10510U, 15W TDP)
+
+| Version | Time (ms) | GFLOPS | Improvement |
+|---------|----------:|-------:|------------:|
+| v121 (no Strassen) | 31249 | 35.2 | baseline |
+| v122 (Strassen, 3 buffers) | **23812** | **46.2** | **+31%** |
+
+Strassen's 12.5% FLOP reduction + thermal benefit (7 shorter 4096 bursts vs one long 8192 burst) + no wasted pacing sleep = 31% wall-clock improvement. All sizes pass correctness verification.
+
+### v122 full suite
+
+| Size | GF(1T) | GF(MT) | Verify |
+|------|-------:|-------:|:------:|
+| 256 | 41.1 | 39.9 | OK |
+| 512 | 39.1 | 91.2 | OK |
+| 1024 | 23.3 | 58.3 | OK |
+| 2048 | 21.5 | 46.8 | OK |
+| 4096 | -- | 43.7 | OK |
+| 8192 | -- | 40.9 | OK |
+
+Env: `COM6_NO_STRASSEN=1` disables Strassen. `COM6_USE_STRASSEN=1` forces it at 4096+ (not recommended — overhead dominates at 4096). All other v121 env knobs preserved.
+
+---
 
 ## COM6 Matrix Multiplication Results (v120 current champion on both platforms)
 
