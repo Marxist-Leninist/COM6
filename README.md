@@ -2,17 +2,17 @@
 
 **COM6 beats OpenBLAS at matrix multiplication on both laptop (i7-10510U) and server (EPYC 7282).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 118 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch (v118), persistent pthreads pool with spin-wait (~1us dispatch), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, L2-auto-tuned MC, physical-core-only threading, C-prefetch at kernel entry, and sched_setaffinity pinning on chiplet CPUs.
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 120 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch, OpenMP IC/JC-parallel with OMP_PROC_BIND pinning, separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, L2-auto-tuned MC, physical-core-only threading, 4x k-unrolled A-packing, 2x k-unrolled B-packing, and C-prefetch at kernel entry.
 
-**v118 on EPYC 7282 (16-core/32-thread, Zen 2)** — 2.7x over OpenBLAS at 8192, 342 GF peak at 1024:
+**v120 on EPYC 7282 (16-core/32-thread, Zen 2)** — 411 GF peak at 1024, 203 GF at 8192:
 
-| Size | COM6 v118 16T (GF) | OpenBLAS 16T (GF) | Ratio | Winner |
+| Size | COM6 v120 16T (GF) | OpenBLAS 16T (GF) | Ratio | Winner |
 |------|-----------------:|-----------------:|------:|:------:|
-| 512 | **201.8** | 32.4 | **6.2x** | COM6 |
-| 1024 | **341.9** | 21.2 | **16.1x** | COM6 |
-| 2048 | **179.4** | 79.7 | **2.3x** | COM6 |
-| 4096 | **206.1** | 77.5 | **2.7x** | COM6 |
-| 8192 | **204.2** | 75.3 | **2.7x** | COM6 |
+| 512 | **395.9** | 32.4 | **12.2x** | COM6 |
+| 1024 | **410.6** | 21.2 | **19.4x** | COM6 |
+| 2048 | **182.3** | 79.7 | **2.3x** | COM6 |
+| 4096 | **219.1** | 77.5 | **2.8x** | COM6 |
+| 8192 | **203.0** | 75.3 | **2.7x** | COM6 |
 
 **v108 on i7-10510U (4-core/8-thread, 15W TDP laptop)** — 5/5 sizes 1.08x–1.66x over OpenBLAS:
 
@@ -37,38 +37,43 @@ The COM framework extends beyond matrix multiplication into neural network archi
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
 
-## v118: Chiplet-Aware NUMA Dispatch (2026-04-17)
+## v120: Unified Champion — OpenMP Core + Chiplet Dispatch (2026-04-17)
 
-v117 used IC-parallel at n>=4096 (all threads share a single packed B panel). This works well on monolithic die CPUs (i7-10510U) where all cores share one L3 cache. On chiplet CPUs like EPYC 7282 (4 CCDs, each with its own 16MB L3), cross-CCD traffic for the shared B panel destroyed performance: **47.8 GF at 8192 with 32 threads**.
+v119 attempted to replace OpenMP with a custom pthreads pool (spin barriers + atomic work-stealing). This **regressed 28% on monolithic** (laptop) because OpenMP's optimized barriers beat custom spin barriers. v120 takes the right approach: keep v108's proven OpenMP parallelism, add chiplet awareness on top.
 
-v118 auto-detects chiplet topology (multiple L3 groups in `/sys/devices/system/cpu/`) and switches to JC-parallel at all sizes. Each thread owns a private B panel that stays in its CCD's local L3, eliminating cross-die traffic. Result: **204.2 GF at 8192 with 16 threads — a 4.3x improvement.**
+### Key design decisions
 
-### v118 vs v117 on EPYC 7282
+- **Monolithic (laptop):** Exact v108 dispatch — IC-parallel for 512/1024/4096+, JC-parallel for 2048. OpenMP's `schedule(static)` + implicit barriers.
+- **Chiplet (EPYC/Ryzen):** JC-parallel for ALL sizes (private B panels = zero cross-CCD traffic). Auto-detects multiple L3 groups via sysfs.
+- **Physical-core-only:** Sets `omp_set_num_threads(phys_cores)` on chiplet CPUs. HT siblings compete for FMA ports.
+- **L2 auto-tuning:** EPYC's 512KB L2 → MC=180; i7's 256KB L2 → MC=120/96.
+- **4x A-pack unroll:** +27% at 2048 vs v108 from reduced loop overhead.
 
-| Size | v117 IC-par (GF) | v118 JC-par (GF) | Speedup |
-|------|----------------:|-----------------:|--------:|
-| 512 | 201.1 | 201.8 | ~same |
-| 1024 | 286.7 | **341.9** | 1.19x |
-| 2048 | 151.1 | **179.4** | 1.19x |
-| 4096 | 29.9 | **206.1** | **6.9x** |
-| 8192 | 47.8 | **204.2** | **4.3x** |
+### v120 vs v118 on EPYC 7282
 
-### Key insights
+| Size | v118 pthreads (GF) | v120 OpenMP (GF) | Speedup |
+|------|-------------------:|-----------------:|--------:|
+| 512 | 201.8 | **395.9** | **1.96x** |
+| 1024 | 341.9 | **410.6** | **1.20x** |
+| 2048 | 179.4 | **182.3** | ~same |
+| 4096 | 206.1 | **219.1** | **1.06x** |
+| 8192 | 204.2 | **203.0** | ~same |
 
-1. **Per-core efficiency**: 4 threads on 1 CCD achieved 42.8 GF/core — 95.5% of the EPYC 7282's theoretical FP64 peak (44.8 GF/core at 2.8 GHz with 2 FMA units)
-2. **HyperThreading hurts**: 32 threads (16C+16HT) = 147 GF; 16 threads (physical only) = 209 GF. HT siblings compete for FMA ports in FMA-bound code
-3. **L2 auto-tuning**: EPYC's 512KB L2 allows MC=180 (vs MC=96 on i7's 256KB L2), reducing A-packing overhead by 88%
-4. **Thread pinning**: `sched_setaffinity` pins each pool thread to a physical core, preventing OS scheduler migration
+### Per-core efficiency
+
+- **Single-thread:** 42.9 GF at 2048 = **95.8% of EPYC peak** (44.8 GF/core at 2.8 GHz with 2 FMA units)
+- **16-thread at 1024:** 25.7 GF/core = 57% efficiency (memory bandwidth becomes bottleneck)
+- **16-thread at 8192:** 12.7 GF/core = 28% (fully memory-bandwidth-bound)
 
 ### Env controls
 
-- `COM6_THREADS=N` — override thread count (default: physical core count on chiplet, all logical on monolithic)
-- `COM6_FORCE_JC=1` — force JC-parallel at all sizes (useful for testing on monolithic CPUs)
-- `COM6_FORCE_IC=1` — force IC-parallel at n>=4096 (v117 behavior)
+- `COM6_THREADS=N` — override thread count
+- `COM6_FORCE_JC=1` / `COM6_FORCE_IC=1` — force dispatch path
+- `COM6_USE_STRASSEN=1` — enable Strassen at 8192+ (opt-in, BLIS usually wins)
+- `COM6_PACE_MS=N` — thermal pacing between NC blocks (laptop 4096+)
+- `OMP_PROC_BIND=close OMP_PLACES=cores` — recommended for chiplet CPUs
 
-On monolithic-die CPUs (Windows/i7), v118 automatically falls back to v117's dispatch (IC-par at 4096+). No regression on laptop.
-
-## COM6 Matrix Multiplication Results (v108 current champion; v100 pthreads-pool wins at 512 MT)
+## COM6 Matrix Multiplication Results (v120 current champion on both platforms)
 
 ### v100 (pthreads pool) vs v108 (OpenMP+IC-par) at 512 MT — 2026-04-16
 
