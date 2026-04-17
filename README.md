@@ -2,7 +2,7 @@
 
 **COM6 beats OpenBLAS at matrix multiplication on both laptop (i7-10510U) and server (EPYC 7282).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 122 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch, OpenMP IC/JC-parallel with OMP_PROC_BIND pinning, separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, L2-auto-tuned MC, physical-core-only threading, 4x k-unrolled A-packing, 2x k-unrolled B-packing, C-prefetch at kernel entry, and memory-efficient Strassen for large sizes (3-buffer, 384MB at 8192 vs 3.2GB naive).
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 124 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch, OpenMP IC/JC-parallel with OMP_PROC_BIND pinning, separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, L2-auto-tuned MC, physical-core-only threading, 4x k-unrolled A-packing, 2x k-unrolled B-packing, C-prefetch at kernel entry, SIMD-accelerated edge kernels, and memory-efficient Strassen for large sizes (3-buffer, 384MB at 8192 vs 3.2GB naive).
 
 **v120 on EPYC 7282 (16-core/32-thread, Zen 2)** — 411 GF peak at 1024, 203 GF at 8192:
 
@@ -36,6 +36,39 @@ The COM framework extends beyond matrix multiplication into neural network archi
 | Inference accuracy | 4/10 | **6/10** | COM7NN |
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
+
+## v124: SIMD Edge Kernel + Server-Aware Blocking (2026-04-17)
+
+v124 adds two improvements over v123's core:
+
+1. **SIMD-accelerated edge kernel**: When `nr == NR` (full-width panel) but `mr < MR` (partial-height), the edge case now routes through the full 6x8 AVX2 FMA micro-kernel via a temp buffer instead of falling back to scalar loops. ~8x faster for edge blocks.
+2. **Server-aware JC-parallel dispatch**: Monolithic servers with L2 >= 512KB now use JC-parallel (independent column strips, zero barriers) for n >= 2048, with L2-proportional MC for optimal A-panel sizing. IC-parallel retained for n < 2048 where shared B-panel benefits from L3 cache sharing.
+
+### v124 vs v123 on Xeon Skylake 16C (back-to-back, same conditions)
+
+| Size | v123 MT (GF) | v124 MT (GF) | Change |
+|------|------------:|-----------:|-------:|
+| 8192 | 213.9 | **222.6** | **+4.1%** |
+| 4096 | 154.7 | **201.1** | **+30.0%** |
+| 2048 | 186.0 | **189.8** | **+2.0%** |
+| 1024 | 177.7 | 170.0 | -4.3% |
+| 512 | 130.9 | 124.5 | -4.9% |
+| 256 | 22.8 | **28.7** | **+25.9%** |
+
+The 4096 improvement (+30%) comes from switching to JC-parallel dispatch with L2-aware MC on the server. Previously, 4096 used IC-parallel which underutilizes L2 on large-cache servers. 512/1024 regressions are within run-to-run noise (~5%).
+
+### v124 full suite (i7-10510U laptop, 4C/8T, 15W TDP)
+
+| Size | GF(1T) | GF(MT) | Verify |
+|------|-------:|-------:|:------:|
+| 256 | 44.9 | 43.2 | OK |
+| 512 | 39.1 | 115.0 | OK |
+| 1024 | 31.5 | 59.5 | OK |
+| 2048 | 26.2 | 51.1 | OK |
+| 4096 | -- | 49.1 | OK |
+| 8192 | -- | 51.5 | OK |
+
+Env: `COM6_THREADS=N` | `COM6_STRASSEN_DEPTH=N` | `COM6_NO_STRASSEN=1`
 
 ## v120: Unified Champion — OpenMP Core + Chiplet Dispatch (2026-04-17)
 
@@ -662,6 +695,9 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 
 | Version | Key Change | Peak GF |
 |---------|------------|---------|
+| **v124** | **SIMD edge kernel + server-aware JC-parallel — +30% at 4096 on Xeon** | **222.6** (Xeon 8192) |
+| **v123** | **Adaptive Strassen depth + L2-auto KC tuning** | **213.9** (Xeon 8192) |
+| **v122** | **Memory-efficient Strassen (3-buffer, 384MB vs 3.2GB)** | **46.2** (laptop 8192) |
 | v1-v6 | COM6 concept, blocked transpose, auto-vec | ~5-10 |
 | v7 | Hand-written AVX2 FMA intrinsics | ~15 |
 | v8-v9 | Double-pumped FMA, BLIS cache blocking | ~25 |
@@ -731,12 +767,12 @@ PERSISTENT THREAD POOL (auto-detect cores, created once)
 Requires GCC with AVX2/FMA support:
 
 ```bash
-# v92: AVX2 + OpenMP + beta-0/1 kernels + dynamic sched + 2x B-pack (recommended, latest)
-gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v92 com6_v92.c -lm
-./com6_v92           # full benchmark (8192-256, reverse order)
-./com6_v92 4096 mt   # single-size MT cold CPU test
-./com6_v92 512 1t    # single-size 1T test
-./com6_v92 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
+# v124: AVX2 + OpenMP + SIMD edge kernel + server-aware blocking (recommended, latest)
+gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v124 com6_v124.c -lm
+./com6_v124           # full benchmark (8192-256, reverse order)
+./com6_v124 4096 mt   # single-size MT cold CPU test
+./com6_v124 512 1t    # single-size 1T test
+./com6_v124 8192 mt   # 8192x8192 MT-only (1T skipped for huge sizes)
 
 # v38: AVX2 + OpenMP
 gcc -O3 -march=native -mavx2 -mfma -funroll-loops -fopenmp -o com6_v38 com6_v38.c -lm
