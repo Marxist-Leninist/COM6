@@ -1,13 +1,7 @@
-"""COM6 v85 vs OpenBLAS — Fair interleaved comparison
-Tests both at each size with cooling to equalize thermal conditions."""
-import numpy as np
-import time
-import subprocess
-import os
-import sys
+"""COM6 v119 vs OpenBLAS -- Fair interleaved comparison"""
+import numpy as np, time, subprocess, os, sys
 
 def bench_openblas_single(n, threads):
-    """Benchmark OpenBLAS at a single size"""
     script = f'''
 import numpy as np, time, os
 os.environ["OMP_NUM_THREADS"]="{threads}"
@@ -35,30 +29,27 @@ print(f"{{best*1000:.1f}},{{gf:.1f}}")
     return 0
 
 def bench_com6_single(exe, n, mode="mt"):
-    """Benchmark COM6 at a single size"""
     r = subprocess.run([exe, str(n), mode], capture_output=True, text=True, timeout=600)
     for line in r.stdout.split('\n'):
         line = line.strip()
-        if 'GF' in line:
-            parts = line.split('|')
+        if 'GF' in line and ('MT(' in line or '1T:' in line):
+            parts = line.split('(')
             for p in parts:
                 if 'GF' in p:
-                    try: return float(p.strip().split()[0])
+                    try: return float(p.replace('GF)', '').strip())
                     except: pass
     return 0
 
 if __name__ == "__main__":
     sizes = [512, 1024, 2048, 4096, 8192]
-    exe = "C:/Users/Scott/com6_v85.exe"
-
+    exe = "C:/Users/Scott/com6-matmul/com6_v119.exe"
     print("=" * 80)
-    print("  COM6 v85 vs OpenBLAS (numpy) -- Fair Interleaved Comparison")
+    print("  COM6 v119 vs OpenBLAS (numpy) -- Fair Interleaved Comparison")
     print("  (10s cooling between each test)")
     print("=" * 80)
     print()
     print(f"{'Size':<10} | {'BLAS MT':>8} | {'COM6 MT':>8} | {'Ratio':>8} | {'Winner':>10}")
     print(f"{'-'*10} | {'-'*8} | {'-'*8} | {'-'*8} | {'-'*10}")
-
     for n in sizes:
         print(f"  Testing {n}...", end='', flush=True)
         time.sleep(10)
@@ -68,6 +59,5 @@ if __name__ == "__main__":
         ratio = com6_gf / blas_gf if blas_gf > 0 else 0
         winner = "COM6 WIN" if ratio > 1 else "BLAS win"
         print(f"\r{n:4d}x{n:<4d}  | {blas_gf:6.1f} GF | {com6_gf:6.1f} GF | {ratio:6.2f}x  | {winner:>10}")
-
     print()
     print("ratio > 1.00 = COM6 is faster")
