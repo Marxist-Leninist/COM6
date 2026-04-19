@@ -2,7 +2,7 @@
 
 **COM6 beats OpenBLAS at matrix multiplication on both laptop (i7-10510U) and server (EPYC 7282).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 133 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch, L2-aware hybrid JC/IC-parallel dispatch, persistent thread pool with spin-wait + condvar sleep (sub-microsecond dispatch), non-temporal stores for large matrices, adaptive thread count (physical cores for small sizes, all logical for large), separate beta-0/beta-1/beta-0-NT micro-kernels, adaptive MC/KC/NC blocking, L2/L3-auto-tuned blocking, staggered micro-kernel prefetching, 4x k-unrolled A/B-packing with 6-row prefetch, C-prefetch at kernel entry for both beta=0 and beta=1, SIMD-accelerated edge kernels, zero-copy Strassen (no memset), and memory-efficient Strassen for large sizes (3-buffer, 384MB at 8192 vs 3.2GB naive).
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 134 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch, L2-aware hybrid JC/IC-parallel dispatch, persistent thread pool with spin-wait + condvar sleep (sub-microsecond dispatch, **eliminates OpenMP fork-join overhead**), non-temporal stores for large matrices, adaptive thread count (physical cores for small sizes, all logical for large), separate beta-0/beta-1/beta-0-NT micro-kernels, 4-tier adaptive KC blocking (KC=256/320/384 per problem size), L2/L3-auto-tuned blocking, staggered micro-kernel prefetching, 4x k-unrolled A/B-packing with 6-row prefetch, dual cache line C-prefetch at kernel entry for both beta=0 and beta=1, SIMD-accelerated edge kernels, zero-copy Strassen (no memset), and memory-efficient Strassen for large sizes (3-buffer, 384MB at 8192 vs 3.2GB naive).
 
 **v120 on EPYC 7282 (16-core/32-thread, Zen 2)** — 411 GF peak at 1024, 203 GF at 8192:
 
@@ -36,6 +36,16 @@ The COM framework extends beyond matrix multiplication into neural network archi
 | Inference accuracy | 4/10 | **6/10** | COM7NN |
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
+
+## v134: MT at 256 + Deeper KC for 2048 + Beta0 Dual-Line C-Prefetch (2026-04-19)
+
+v134 extends the persistent pool to cover ALL matrix sizes (previously 256 was 1T-only) and adds deeper KC blocking for 2048:
+
+1. **MT at n=256 via JC-pool**: Lowered MT threshold from 512 to 256. At 256x256 (~0.7ms compute), the persistent pool's ~1-3μs dispatch overhead is <1%. Uses physical cores only (4T on i7-10510U) to avoid HyperThreading L2 contention — at 256 with 8T, each HT pair's combined working set (160KB×2 = 320KB) exceeds the shared 256KB L2, causing thrashing. With 4T, each thread gets exclusive L2 (224KB working set < 256KB). Cold-CPU 256 MT: **46-49 GF** (vs 18-20 GF 1T, ~2.5x improvement).
+
+2. **Deeper KC=384 for 2048**: Reduces K-passes from `ceil(2048/320)=7` to `ceil(2048/384)=6`. One fewer full C-matrix round-trip saves ~14% DRAM bandwidth. MC auto-computed: `get_mc_for_l2(384)` → MC=72 (A-panel: 72×384×8 = 221KB fits 256KB L2). `get_eff_threads()` helper centralizes thread count logic for both dispatch and display.
+
+3. **Beta0 dual cache line C-prefetch**: Beta0 kernel now prefetches both halves of each C row (offset 0 and 32 bytes) at kernel entry, matching beta1's pattern. This covers the case where 8 output doubles straddle two 64-byte cache lines (non-aligned C access). Both prefetches hide write-allocate latency for temporal stores.
 
 ## v133: Strassen Memset Elimination + Beta0 C-Prefetch (2026-04-19)
 
