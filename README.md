@@ -2,7 +2,7 @@
 
 **COM6 beats OpenBLAS at matrix multiplication on both laptop (i7-10510U) and server (EPYC 7282).**
 
-COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 132 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch, L2-aware hybrid JC/IC-parallel dispatch, persistent thread pool with spin-wait + condvar sleep (sub-microsecond dispatch), non-temporal stores for large matrices, adaptive thread count (physical cores for small sizes, all logical for large), separate beta-0/beta-1 micro-kernels, adaptive MC/KC/NC blocking, L2/L3-auto-tuned blocking, staggered micro-kernel prefetching, 4x k-unrolled A/B-packing with 6-row prefetch, C-prefetch at kernel entry, SIMD-accelerated edge kernels, and memory-efficient Strassen for large sizes (3-buffer, 384MB at 8192 vs 3.2GB naive).
+COM6 is a high-performance matrix multiplication engine built from scratch in C with hand-written x86-64 inline assembly. Through 133 versions of iterative optimization, it evolved from naive loops into a BLIS-class implementation featuring: 8x k-unrolled FMA micro-kernels (AVX2 6x8), 5-loop cache hierarchy blocking, chiplet-aware NUMA dispatch, L2-aware hybrid JC/IC-parallel dispatch, persistent thread pool with spin-wait + condvar sleep (sub-microsecond dispatch), non-temporal stores for large matrices, adaptive thread count (physical cores for small sizes, all logical for large), separate beta-0/beta-1/beta-0-NT micro-kernels, adaptive MC/KC/NC blocking, L2/L3-auto-tuned blocking, staggered micro-kernel prefetching, 4x k-unrolled A/B-packing with 6-row prefetch, C-prefetch at kernel entry for both beta=0 and beta=1, SIMD-accelerated edge kernels, zero-copy Strassen (no memset), and memory-efficient Strassen for large sizes (3-buffer, 384MB at 8192 vs 3.2GB naive).
 
 **v120 on EPYC 7282 (16-core/32-thread, Zen 2)** — 411 GF peak at 1024, 203 GF at 8192:
 
@@ -36,6 +36,16 @@ The COM framework extends beyond matrix multiplication into neural network archi
 | Inference accuracy | 4/10 | **6/10** | COM7NN |
 
 Same architecture (d_model=64, 4 heads, d_ff=128, 1 layer), same data (counting task), same seed. COM7NN converges faster, trains faster, and predicts more accurately.
+
+## v133: Strassen Memset Elimination + Beta0 C-Prefetch (2026-04-19)
+
+v133 adds two optimizations over v132:
+
+1. **Strassen memset elimination**: Instead of `memset(C, 0)` + `c_acc_add` for all M-products, v133 tracks per-quadrant first-write: the first accumulation into each C quadrant uses `c_set` (direct copy from M), subsequent ones use `c_acc_add`/`c_acc_sub`. Eliminates n×n×8 bytes of wasted zero-writes (512MB at 8192) and saves one full C-matrix read per first-touch quadrant (avoids read-modify-write on zeroed data).
+
+2. **Beta0 C-row prefetch**: The beta=0 micro-kernel now prefetches all 6 C output rows at kernel entry (matching beta=1's behavior). This primes the cache lines ~240 cycles before the final `vmovupd` stores, hiding write-allocate latency when C rows aren't already in L1.
+
+Both changes verified correct at all sizes (naive comparison at 512, 1T-vs-MT cross-check at larger sizes).
 
 ## v132: Non-Temporal Stores for Large Matrices (2026-04-19)
 
